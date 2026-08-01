@@ -46,8 +46,10 @@ class Model:
     """
 
     config: ModelConfig = None
+
     # Stores multiple independent conversation histories
     messageHistories = []
+
     # vLLM-related objects
     llm             = None
     sampling_params = None
@@ -164,7 +166,6 @@ class Model:
         user turn to be appended/closed).
         """
         inputs = []
-        l = Logger()
         # Build a prompt for each conversation history
         for messageHistory in self.messageHistories:
             prompt = ""
@@ -194,7 +195,7 @@ class Model:
 
         # Extract and clean generated text
         for text in generatedText:
-            outputs.append(text.outputs[0].text)
+            outputs.append(str(text.outputs[0].text).strip())
 
         # Append model responses to histories
         self.addPrompt(role = modelRole, message = outputs)

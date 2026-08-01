@@ -1,6 +1,7 @@
 import sys
 # Prevent Python from generating .pyc files (compiled bytecode files)
 sys.dont_write_bytecode = True
+
 from Logger import Logger
 import os
 
@@ -82,7 +83,8 @@ def writePrompt(path: str, histories: list) -> int:
                 prompt      = history[index2]
                 role        = prompt[messageRoleElement]
                 text        = str(prompt[messageTextElement])
-                message     = f"{index};{index2};{role};{len(text)};{text.replace('\n', '')}\n"
+                text2       = text.replace('\n', '')
+                message     = f"{index};{index2};{role};{len(text)};{text2}" + "\n" 
                 prompt_log_file.write(message)
                 ret = ret + 1
 

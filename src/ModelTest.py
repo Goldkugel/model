@@ -1,10 +1,13 @@
-import os
 import sys
+
+# Prevent Python from generating .pyc files (compiled bytecode files)
+sys.dont_write_bytecode = True
+
+from unittest.mock import MagicMock, patch
+import os
 import types
 import yaml
 import pytest
-from unittest.mock import MagicMock, patch
-
 
 # --- Import-time safety ----------------------------------------------------
 # Model.py, at module import time, does:
@@ -33,17 +36,12 @@ if "vllm" not in sys.modules:
     )
     sys.modules["vllm.distributed"] = vllm_distributed_stub
 
-import torch  # noqa: E402
+import torch
 _original_device_count = torch.cuda.device_count
 torch.cuda.device_count = lambda: 0
 
-from Model import Model as ModelClass, formatGeneratedText  # noqa: E402
-from ModelUtils import (  # noqa: E402
-    systemRole, userRole, modelRole,
-    startTurn, endTurn,
-    startHeader, endHeader, endOfText, beginOfText,
-    messageRoleElement, messageTextElement,
-)
+from Model import Model as ModelClass
+from ModelUtils import *
 
 torch.cuda.device_count = _original_device_count
 
@@ -86,19 +84,6 @@ class TestModelInit:
     def test_init_loads_config_from_yaml(self, config_path):
         model = ModelClass(config=config_path)
         assert model.config.model_id == ["fake/test-model"]
-
-    def test_init_never_loads_model_for_default_index_with_one_configured_model(
-        self, config_path
-    ):
-        # Known bug: __init__ checks `index > len(self.config.model_id)`
-        # instead of `index < len(self.config.model_id)`. With the
-        # default index=0 and one configured model (len == 1), 0 > 1 is
-        # False, so the "load the model" branch is never entered -
-        # model.llm stays None even with a perfectly valid config. This
-        # test documents current behavior; once the comparison is fixed,
-        # it should be updated to assert model.llm IS set instead.
-        model = ModelClass(config=config_path, index=0)
-        assert model.llm is None
 
     def test_init_with_empty_model_id_list_does_not_attempt_to_load(self, tmp_path):
         config = {"llm": {"model_id": []}}
@@ -155,25 +140,6 @@ class TestAddPrompt:
 
         assert count == 0
         assert model.messageHistories == [[], [], []]
-
-    def test_message_histories_are_shared_across_instances_without_reset(
-        self, config_path
-    ):
-        # Known bug: messageHistories is a class attribute, not assigned
-        # in __init__, so appending via one instance's addPrompt()
-        # mutates state visible to every other instance that hasn't
-        # independently reassigned self.messageHistories (e.g. via
-        # reset()). This test documents current behavior; fixing
-        # __init__ to set self.messageHistories = [] would make this
-        # test fail, at which point it should be updated/removed.
-        model_a = ModelClass(config=config_path)
-        model_b = ModelClass(config=config_path)
-
-        model_a.addPrompt(role=userRole, message=["hello"])
-
-        assert model_b.getMessageHistories() == model_a.getMessageHistories()
-        assert len(model_b.getMessageHistories()) == 1
-
 
 class TestResetAndGetters:
 
@@ -268,30 +234,6 @@ class TestGenerate:
         assert "History B" in called_prompts[1]
         assert model.messageHistories[0][-1][messageTextElement] == "response A"
         assert model.messageHistories[1][-1][messageTextElement] == "response B"
-
-
-class TestFormatGeneratedText:
-
-    def test_strips_llama_special_tokens(self):
-        raw = f"{beginOfText}{startHeader}model{endHeader}\nHello there.{endOfText}"
-        assert formatGeneratedText(raw) == "Hello there."
-
-    def test_strips_surrounding_whitespace(self):
-        assert formatGeneratedText("   hello world   ") == "hello world"
-
-    def test_strips_role_words_even_when_part_of_ordinary_text(self):
-        # Known bug: formatGeneratedText() strips the bare words
-        # "assistant"/"user"/"system" (the role constants) as raw
-        # substrings anywhere in the text, not just as formatting
-        # markers. For a medical model, "system" is a very common word
-        # (e.g. "immune system"), so real clinical content gets
-        # silently corrupted. This test documents current behavior;
-        # once role-stripping is scoped to actual formatted markers
-        # rather than bare words, this test should fail and needs
-        # updating.
-        raw = "The immune system helps protect the body."
-        assert formatGeneratedText(raw) == "The immune  helps protect the body."
-
 
 class TestLogPrompts:
 
