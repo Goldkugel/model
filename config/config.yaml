@@ -1,14 +1,3 @@
-llm:
-  model_id: 
-    - "google/medgemma-27b-text-it"
-  seed: 2898231092
-  temperature: 0.01
-  top_p: 0.95
-  max_model_len: 8192
-  max_num_batched_tokens: 16384
-  max_tokens: 2048
-  prompt_log_folder: "../data/logs/"
-  prompt_log_file: "prompts.log"
 adapter:
   hpo:
     input_folder: "../data/input/hpo/"
@@ -32,6 +21,22 @@ adapter:
     output_folder: "../data/output/transformed/sct/"
     output_file: "sct.csv"
     skip_if_present: False
+    encoding: "utf-8"
+    separator: "\t"
+  umls:
+    input_folder: "../data/input/umls/"
+    input_files:
+      - "MRCONSO.RRF"
+      - "MRDEF.RRF"
+      - "MRRANK.RRF"
+      - "MRREL.RRF"
+      - "MRSAT.RRF"
+      - "MRSTY.RRF"
+    output_folder: "../data/output/transformed/umls/"
+    output_file: "umls.csv"
+    skip_if_present: False
+    encoding: "utf-8"
+    separator: "|"
 logger:
   folder: "../data/logs/"
   file_name: "output.log"
@@ -39,3 +44,19 @@ logger:
   header_length: 60
   log_runtime: True
   format: "%Y-%m-%d %H:%M:%S"
+normalizer:
+  lower_case: True
+  lemmatizing: True
+  stemming: False
+  stop_word_removal: True
+llm:
+  model_id: 
+    - "google/medgemma-27b-text-it"
+  seed: 2898231092
+  temperature: 0.01
+  top_p: 0.95
+  max_model_len: 8192
+  max_num_batched_tokens: 16384
+  max_tokens: 2048
+  prompt_log_folder: "../data/logs/"
+  prompt_log_file: "prompts.log"
