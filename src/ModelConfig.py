@@ -41,7 +41,7 @@ class ModelConfig(BaseModel):
 
     # Directory where the prompt log file will be written (relative or
     # absolute path).
-    prompt_log_folder: str      = "../data/logs/"
+    prompt_log_folder: str      = "./data/logs/"
 
     # Name of the prompt log file to write to within `prompt_log_folder`.
     prompt_log_file: str        = "prompts.log"

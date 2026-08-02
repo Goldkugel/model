@@ -40,8 +40,8 @@ import torch
 _original_device_count = torch.cuda.device_count
 torch.cuda.device_count = lambda: 0
 
-from Model import Model as ModelClass
-from ModelUtils import *
+from .Model import Model as ModelClass
+from .ModelUtils import *
 
 torch.cuda.device_count = _original_device_count
 

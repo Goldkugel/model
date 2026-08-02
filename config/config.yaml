@@ -1,13 +1,13 @@
 adapter:
   hpo:
-    input_folder: "../data/input/hpo/"
+    input_folder: "./data/input/hpo/"
     input_files:
       - "hp.owl"
-    output_folder: "../data/output/transformed/hpo/"
+    output_folder: "./data/output/transformed/hpo/"
     output_file: "hpo.csv"
     skip_if_present: False
   sct:
-    input_folder: "../data/input/sct/"
+    input_folder: "./data/input/sct/"
     input_files:
       - "der2_sRefset_SimpleMapFull_INT_20260701.txt"
       - "sct2_Concept_Full_INT_20260701.txt"
@@ -18,13 +18,13 @@ adapter:
       - "sct2_Identifier_Full_INT_20260701.txt"
       - "sct2_StatedRelationship_Full_INT_20260701.txt"
       - "sct2_TextDefinition_Full-en_INT_20260701.txt"
-    output_folder: "../data/output/transformed/sct/"
+    output_folder: "./data/output/transformed/sct/"
     output_file: "sct.csv"
     skip_if_present: False
     encoding: "utf-8"
     separator: "\t"
   umls:
-    input_folder: "../data/input/umls/"
+    input_folder: "./data/input/umls/"
     input_files:
       - "MRCONSO.RRF"
       - "MRDEF.RRF"
@@ -32,13 +32,13 @@ adapter:
       - "MRREL.RRF"
       - "MRSAT.RRF"
       - "MRSTY.RRF"
-    output_folder: "../data/output/transformed/umls/"
+    output_folder: "./data/output/transformed/umls/"
     output_file: "umls.csv"
     skip_if_present: False
     encoding: "utf-8"
     separator: "|"
 logger:
-  folder: "../data/logs/"
+  folder: "./data/logs/"
   file_name: "output.log"
   header_char: "-"
   header_length: 60
@@ -58,5 +58,5 @@ llm:
   max_model_len: 8192
   max_num_batched_tokens: 16384
   max_tokens: 2048
-  prompt_log_folder: "../data/logs/"
+  prompt_log_folder: "./data/logs/"
   prompt_log_file: "prompts.log"

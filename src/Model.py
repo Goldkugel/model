@@ -6,9 +6,9 @@ sys.dont_write_bytecode = True
 # vLLM imports for model loading and inference
 from vllm               import LLM, SamplingParams
 from vllm.distributed   import destroy_distributed_environment, destroy_model_parallel
-from ModelConfig        import ModelConfig
-from ModelUtils         import *
-from Logger             import Logger
+from .ModelConfig        import ModelConfig
+from .ModelUtils         import *
+from logger             import Logger
 import os
 import contextlib
 import gc
@@ -19,7 +19,7 @@ import yaml
 configuration_section: str  = "llm"
 
 # Default path to the config file, used if no path is explicitly passed in.
-standard_directory: str     = "../config/config.yaml"
+standard_directory: str     = "./config/config.yaml"
 
 # Ensure CUDA devices are enumerated by PCI bus ID
 # This guarantees consistent GPU ordering across runs
