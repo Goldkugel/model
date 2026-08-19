@@ -1,93 +1,125 @@
 import sys
-# Prevent Python from generating .pyc files (compiled bytecode files)
+# Prevent Python from writing .pyc bytecode cache files to keep container 
+# environments clean
 sys.dont_write_bytecode = True
 
 from logger import Logger
 import os
 
-# Chat message roles, matching the conventions used by most chat-tuned
-# LLM prompt formats.
-systemRole          = "system"
-userRole            = "user"
-modelRole           = "assistant"
+# ==============================================================================
+# Role Definitions
+# Standard chat message roles matching conventions used by chat-tuned LLM 
+# interfaces.
+# ==============================================================================
+systemRole      = "system"
+userRole        = "user"
+modelRole       = "assistant"
 
-# Special token identifiers (without the surrounding <...>/<|...|>
-# delimiters) used by different model families to mark turn/message
-# boundaries in their raw prompt format.
+# ==============================================================================
+# Execution Device Identifiers
+# ==============================================================================
+gpu             = "cuda"
+cpu             = "cpu"
+target_device   = "VLLM_TARGET_DEVICE"
 
-# For Gemma
-startTurnID         = "start_of_turn"
-endTurnID           = "end_of_turn"
+# ==============================================================================
+# Raw Special Token Identifiers (Without Enclosing Delimiters)
+# Used to construct exact turn and boundary tokens across distinct model 
+# families.
+# ==============================================================================
 
-# For Llama
-startHeaderID       = "start_header_id"
-endHeaderID         = "end_header_id"
-endOfTextID         = "eot_id"
-beginOfTextID       = "begin_of_text"
-endOfTextID2        = "end_of_text"
+# --- Gemma Family Identifiers ---
+startTurnID     = "start_of_turn"
+endTurnID       = "end_of_turn"
 
-# Delimiter characters used to build the full special-token strings below.
-startTag            = "<"
-endTag              = ">"
-bar                 = "|"
-unusedTokens        = "<unused95>"
+# --- Llama Family Identifiers ---
+startHeaderID   = "start_header_id"
+endHeaderID     = "end_header_id"
+endOfTextID     = "eot_id"
+beginOfTextID   = "begin_of_text"
+endOfTextID2    = "end_of_text"
 
-# Fully-formed special tokens, one per model family, built from the
-# identifiers and delimiters above.
+# ==============================================================================
+# Structural Delimiters
+# Characters used to encapsulate raw token IDs into valid special-token tags.
+# ==============================================================================
+startTag        = "<"
+endTag          = ">"
+bar             = "|"
+unusedTokens    = "<unused95>"
 
-# For Gemma
-startTurn           = f"{startTag}{startTurnID}{endTag}"
-endTurn             = f"{startTag}{endTurnID}{endTag}"
+# ==============================================================================
+# Fully Formed Special Tokens
+# Assembled token tags corresponding to respective tokenizer template formats.
+# ==============================================================================
 
-# For Llama
-startHeader         = f"{startTag}{bar}{startHeaderID}{bar}{endTag}"
-endHeader           = f"{startTag}{bar}{endHeaderID}{bar}{endTag}"
-endOfText           = f"{startTag}{bar}{endOfTextID}{bar}{endTag}"
-beginOfText         = f"{startTag}{bar}{beginOfTextID}{bar}{endTag}"
-endOfText2          = f"{startTag}{bar}{endOfTextID2}{bar}{endTag}"
+# --- Gemma Tag Definitions ---
+startTurn       = f"{startTag}{startTurnID}{endTag}"        # e.g., "<start_of_turn>"
+endTurn         = f"{startTag}{endTurnID}{endTag}"          # e.g., "<end_of_turn>"
 
-# Keys used within each message dict passed into writePrompt(): the
-# speaker role and the message text itself.
-messageRoleElement  = "role"
-messageTextElement  = "message"
+# --- Llama Tag Definitions ---
+startHeader     = f"{startTag}{bar}{startHeaderID}{bar}{endTag}"  # e.g., "<|start_header_id|>"
+endHeader       = f"{startTag}{bar}{endHeaderID}{bar}{endTag}"    # e.g., "<|end_header_id|>"
+endOfText       = f"{startTag}{bar}{endOfTextID}{bar}{endTag}"    # e.g., "<|eot_id|>"
+beginOfText     = f"{startTag}{bar}{beginOfTextID}{bar}{endTag}"  # e.g., "<|begin_of_text|>"
+endOfText2      = f"{startTag}{bar}{endOfTextID2}{bar}{endTag}"   # e.g., "<|end_of_text|>"
+
+# ==============================================================================
+# History Key Constants
+# Property dictionary keys used inside message objects passed to writePrompt().
+# ==============================================================================
+messageRoleElement = "role"
+messageTextElement = "content"
 
 
-def writePrompt(path: str, histories: list) -> int:
+# ==============================================================================
+# Logging Utilities
+# ==============================================================================
+
+def writePrompt(path: str, histories: list[list[dict]]) -> int:
     """
-    Write one or more prompt/response histories to a semicolon-delimited
-    log file for later inspection.
+    Writes prompt and response histories to a semicolon-delimited CSV log file.
 
-    `histories` is a list of histories, where each history is itself a
-    list of messages (dicts with a `messageRoleElement` and a
-    `messageTextElement` key) representing one full conversation - e.g.
-    system/user/assistant turns exchanged with the model.
-
-    One row is written per message, across all histories, in the form:
-    history index ; message index within that history ; role ;
-    message length (characters) ; message text (newlines stripped).
-
-    Returns the total number of rows (messages) written.
+    :param path: Destination file path for the prompt log.
+    :param histories: List of conversation threads, where each thread is a list
+        of dictionaries containing role and message content keys.
+    :return: Total number of individual messages logged across all histories.
     """
-    ret = 0
+    total_written = 0
 
     l = Logger()
     file_name = os.path.basename(path)
     l.log(f"Logging prompts in '{file_name}'...")
 
-    with open(path, mode="w") as prompt_log_file:
+    # Ensure output parent directories exist before writing
+    parent_dir = os.path.dirname(path)
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+
+    with open(path, mode="w", encoding="utf-8") as prompt_log_file:
+        # Write CSV header row
         header = "history;prompt;role;length;text\n"
         prompt_log_file.write(header)
-        for index in range(0, len(histories)):
-            history = histories[index]
-            for index2 in range(0, len(histories[index])):
-                prompt      = history[index2]
-                role        = prompt[messageRoleElement]
-                text        = str(prompt[messageTextElement])
-                text2       = text.replace('\n', '')
-                message     = f"{index};{index2};{role};{len(text)};{text2}" + "\n" 
-                prompt_log_file.write(message)
-                ret = ret + 1
+
+        # Iterate over each conversation history thread
+        for history_idx, history in enumerate(histories):
+            # Iterate over each message turn within the history thread
+            for message_idx, prompt in enumerate(history):
+                role = prompt[messageRoleElement]
+                text = str(prompt[messageTextElement])
+                
+                # Replace newlines with spaces to maintain one log entry per 
+                # line, and sanitize embedded semicolons to prevent column 
+                # misalignment.
+                sanitized_text = text.replace('\r\n', ' ').replace('\n', ' ').replace(';', ',')
+
+                # Format row: history_index; message_index; role; 
+                # raw_character_length; sanitized_text
+                log_line = f"{history_idx};{message_idx};{role};{len(text)};{sanitized_text}\n"
+                
+                prompt_log_file.write(log_line)
+                total_written += 1
 
     l.log(f"Logging prompts in '{file_name}' completed.")
     
-    return ret
+    return total_written

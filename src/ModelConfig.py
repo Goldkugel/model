@@ -1,8 +1,10 @@
 import sys
-# Prevent Python from generating .pyc files (compiled bytecode files)
+
+# Prevent Python from writing .pyc bytecode cache files to keep container environments clean
 sys.dont_write_bytecode = True
 
-from pydantic import BaseModel, ConfigDict
+from typing     import Literal
+from pydantic   import BaseModel, ConfigDict, Field
 
 class ModelConfig(BaseModel):
     """
@@ -11,37 +13,84 @@ class ModelConfig(BaseModel):
     prompt logging).
     """
 
-    model_config                = ConfigDict(extra = "forbid")
+    # Forbid extra fields in the YAML file to catch typos early
+    model_config = ConfigDict(extra="forbid")
 
-    # One or more model identifiers to load/prompt (e.g. a HuggingFace
-    # model ID such as "google/medgemma-27b-text-it").
-    model_id: list              = []
+    # One or more model identifiers to load/prompt (e.g. "google/medgemma-27b-text-it").
+    model_id: list[str] = Field(
+        default_factory=list,
+        description="List of HuggingFace or local model repository identifiers."
+    )
 
-    # Random seed used for reproducible generation.
-    seed: int                   = 2898231092
+    # Random seed used for reproducible generation across runs.
+    seed: int = Field(
+        default=2898231092,
+        description="Random seed for generation determinism."
+    )
 
-    # Sampling temperature: controls randomness of generation (0 =
-    # deterministic/greedy, higher values = more random).
-    temperature: float          = 0.01
+    # Sampling temperature: controls randomness (0.0 = greedy/deterministic).
+    temperature: float = Field(
+        default=0.01,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature controlling output randomness."
+    )
 
-    # Nucleus sampling probability mass: only tokens within the top
-    # `top_p` cumulative probability are considered at each step.
-    top_p: float                = 0.95
+    # Nucleus sampling probability mass boundary.
+    top_p: float = Field(
+        default=0.95,
+        gt=0.0,
+        le=1.0,
+        description="Top-p (nucleus) sampling threshold."
+    )
 
-    # Maximum context length (in tokens) the model is configured to
-    # support, covering prompt + generated tokens combined.
-    max_model_len: int          = 8192
+    # Maximum context length (in tokens) covering combined prompt and output length.
+    max_model_len: int = Field(
+        default=8192,
+        gt=0,
+        description="Maximum model context window size in tokens."
+    )
 
-    # Maximum number of tokens batched together across concurrent
-    # requests (a vLLM-style throughput/memory tuning parameter).
-    max_num_batched_tokens: int = 16384
+    # Maximum number of tokens batched together across concurrent requests (vLLM memory tuning).
+    max_num_batched_tokens: int = Field(
+        default=16384,
+        gt=0,
+        description="vLLM batch engine token throughput limit."
+    )
 
-    # Maximum number of tokens to generate per output sequence.
-    max_tokens: int             = 2048
+    # Maximum number of new tokens generated per output sequence.
+    max_tokens: int = Field(
+        default=2048,
+        gt=0,
+        description="Maximum generation length per request."
+    )
 
-    # Directory where the prompt log file will be written (relative or
-    # absolute path).
-    prompt_log_folder: str      = "./data/logs/"
+    # Directory where prompt log files are saved.
+    prompt_log_folder: str = Field(
+        default="./data/logs/",
+        description="Directory target for execution logs."
+    )
 
-    # Name of the prompt log file to write to within `prompt_log_folder`.
-    prompt_log_file: str        = "prompts.log"
+    # Log filename within `prompt_log_folder`.
+    prompt_log_file: str = Field(
+        default="prompts.log",
+        description="Output filename for CSV prompt histories."
+    )
+
+    # Target hardware execution device. Restricted strictly to "gpu" or "cpu".
+    device: Literal["gpu", "cpu"] = Field(
+        default="gpu",
+        description="Target execution device platform ('gpu' or 'cpu')."
+    )
+
+    # Directory containing prompt template files (.md or .txt).
+    prompt_folder: str = Field(
+        default="./prompts/",
+        description="Directory containing input prompt template files."
+    )
+
+    # List of prompt files to process in sequential prompting order.
+    prompt_files: list[str] = Field(
+        default_factory=list,
+        description="Ordered sequence of prompt template filenames."
+    )

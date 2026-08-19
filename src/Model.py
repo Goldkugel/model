@@ -1,255 +1,328 @@
 import sys
-# Prevent Python from generating .pyc (bytecode cache) files
-# Useful for cleaner environments and containerized deployments
+# Prevent Python from writing .pyc bytecode cache files to keep container environments clean
 sys.dont_write_bytecode = True
 
-# vLLM imports for model loading and inference
 from vllm               import LLM, SamplingParams
 from vllm.distributed   import destroy_distributed_environment, destroy_model_parallel
-from .ModelConfig        import ModelConfig
-from .ModelUtils         import *
+from .ModelConfig       import ModelConfig
+from .ModelUtils        import *
 from logger             import Logger
+from pathlib            import Path
+import logging
 import os
 import contextlib
 import gc
 import torch
 import yaml
 
-# Key under which model settings are expected to live in the YAML config file.
-configuration_section: str  = "llm"
+# Suppress verbose vLLM initialization and internal status logs
+logging.getLogger("vllm").setLevel(logging.ERROR)
 
-# Default path to the config file, used if no path is explicitly passed in.
-standard_directory: str     = "./config/config.yaml"
-
-# Ensure CUDA devices are enumerated by PCI bus ID
-# This guarantees consistent GPU ordering across runs
-os.environ["CUDA_DEVICE_ORDER"]     = "PCI_BUS_ID"
-os.environ["VLLM_TARGET_DEVICE"]    = "cuda"
-
-# Total number of GPUs visible to this process before any restriction below.
-gpus = int(torch.cuda.device_count())
-
-# Restrict CUDA_VISIBLE_DEVICES to every detected GPU (intended to produce
-# e.g. "0,1,2" for 3 GPUs, so downstream code sees a consistent, explicit
-# device list rather than relying on defaults).
-if gpus > 0:
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in range(0, gpus)])
-
+# Global configuration constants
+# YAML key where LLM config options are stored
+configuration_section: str = "llm"       
+# Default path for the configuration file
+standard_directory: str = "./config/config.yaml"  
 
 class Model:
     """
-    Wrapper class around vLLM to manage:
-    - Message histories (chat state)
-    - Prompt formatting for different model families
-    - Text generation
-    - Cleanup of distributed GPU resources
+    Wrapper class around the vLLM engine to manage multi-turn chat sessions,
+    batch prompt formatting, text generation, and GPU resource cleanup.
     """
-
-    config: ModelConfig = None
-
-    # Stores multiple independent conversation histories
-    messageHistories = []
-
-    # vLLM-related objects
-    llm             = None
-    sampling_params = None
-    model           = None
 
     def __init__(self, config: str = standard_directory, index: int = 0):
         """
-        Load and validate model configuration from a YAML file, then
-        load the model at position `index` within the configured
-        `model_id` list into vLLM.
+        Loads configuration from a YAML file, validates hardware availability, 
+        and initializes the vLLM engine with the selected model.
+
+        :param config: Path to the YAML configuration file.
+        :param index: Index of the model ID to load from the config's model_id 
+            list.
         """
-        data = None
+        l = Logger()
+        
+        # Instance attribute initialization (prevents class-level state sharing)
 
-        self.messageHistories   = []
-        self.llm                = None
-        self.sampling_params    = None
-        self.model              = None
+        # Stores active conversation threads
+        self.messageHistories: list[list[dict]] = []  
+        # Holds the active vLLM instance
+        self.llm: LLM = None                          
+        # Generation parameters (temp, top_p, max_tokens)
+        self.sampling_params: SamplingParams = None   
+        # Identifier/path of the loaded model
+        self.model: str = None                        
+        # Validated Pydantic/dataclass configuration
+        self.config: ModelConfig = None               
 
-        with open(config, "r") as f:
+        # --- Step 1: Load and Validate Configuration ---
+        config_path = Path(config)
+        if not config_path.is_file():
+            l.log(f"Config file not found at '{config}'")
+            raise FileNotFoundError(f"Config file not found at '{config}'")
+
+        with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
+            
+        # Parse the 'llm' dictionary section using the ModelConfig validator
         self.config = ModelConfig.model_validate(data[configuration_section])
 
-        l = Logger()
-        l.log(f"Loading model at index {index}...")
-        if len(self.config.model_id) > 0 and index < len(self.config.model_id):
-            model = self.config.model_id[index]
-            l.log(f"Model ID: '{model}'.")
-            l.log(f"Cuda available: {torch.cuda.is_available()}.")
-            l.log(f"Device count: {torch.cuda.device_count()}.")
-            l.log(f"Maximum number fof batched tokens: {self.config.max_num_batched_tokens}.")
-            l.log(f"Maximum number of new tokens: {self.config.max_tokens}.")
-            l.log(f"Temperature: {self.config.temperature}.")
-            l.log(f"Max Model Length: {self.config.max_model_len}.")
-            l.log(f"GPUs: {gpus}.")
-            l.log("Loading model into gpu...")
-            # Initialize vLLM engine
-            self.llm = LLM(
-                model                   = model,
-                # Number of GPUs used for tensor parallelism
-                tensor_parallel_size    = gpus,
-                max_model_len           = self.config.max_model_len,
-                # Enable expert parallelism only for specific models
-                enable_expert_parallel  = (
-                    model == "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
-                )
-            )
-            # Sampling configuration for text generation
-            self.sampling_params = SamplingParams(
-                temperature             = self.config.temperature,
-                top_p                   = self.config.top_p,
-                max_tokens              = self.config.max_tokens
-            )
-            l.log("Loading model into gpu completed.")
-            l.log(f"Loading model at index {index} completed.")
+        # --- Step 2: Validate Model Selection Index ---
+        if not (0 <= index < len(self.config.model_id)):
+            l.log(f"No model specified or index {index} out of range.")
+            return
+
+        model = self.config.model_id[index]
+        self.model = model
+        l.log(f"Loading model at index {index}: '{model}'...")
+
+        device = self.config.device
+        l.log(f"Scanning device {device}...")
+
+        # --- Step 3: Configure Hardware Target (GPU vs. CPU) ---
+        gpus = 0
+        if device == gpu:
+            cuda_ok = torch.cuda.is_available()
+            l.log(f"Cuda available: {cuda_ok}.")
+            
+            if not cuda_ok:
+                l.log("No GPU available.")
+                return
+
+            gpus = int(torch.cuda.device_count())
+            l.log(f"GPU Amount: {gpus}.")
+
+            if gpus == 0:
+                l.log("No GPU visible.")
+                return
+
+            # Force CUDA to enumerate GPUs by physical PCI bus ID for 
+            # consistent ordering.
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            os.environ[target_device] = gpu
         else:
-            l.log("No model specified or index out of range.")
+            # Set target device environment variable to CPU.
+            os.environ[target_device] = cpu
 
-    def addPrompt(self, role : str = userRole, message : list = None) -> int:
+        l.log(f"Scanning device {device} completed.")
+        l.log(f"Maximum number of batched tokens: " \
+            f"{self.config.max_num_batched_tokens}.")
+        l.log(f"Maximum number of new tokens: {self.config.max_tokens}.")
+        l.log(f"Temperature: {self.config.temperature}.")
+        l.log(f"Max Model Length: {self.config.max_model_len}.")
+        
+        # --- Step 4: Configure vLLM Sampling Parameters ---
+        self.sampling_params = SamplingParams(
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            max_tokens=self.config.max_tokens
+        )
+
+        # --- Step 5: Initialize the vLLM Engine ---
+        l.log("Loading model...")
+        
+        if device == gpu:
+            # Multi-GPU CUDA initialization with Tensor Parallelism.
+            self.llm = LLM(
+                model=model,
+                # Distributes model across all available GPUs.
+                tensor_parallel_size=gpus,  
+                max_model_len=self.config.max_model_len,
+                # Enable expert parallelism only for Mixture-of-Experts (MoE) 
+                # architectures.
+                enable_expert_parallel=("Qwen3-30B" in model)
+            )
+        else:
+            # CPU single-node execution initialization
+            self.llm = LLM(
+                model=model,
+                device=cpu,
+                max_model_len=self.config.max_model_len
+            )
+
+        l.log(f"Loading model into {device} completed.")
+        l.log(f"Loading model at index {index} completed.")
+
+    def addPrompt(self, role: str = userRole, message: list = None) -> int:
         """
-        Add a message (or messages) to the conversation histories.
+        Appends user or model messages to the conversation histories.
 
-        Supports:
-        - Broadcasting a single message to all histories
-        - Appending one message per history
-        - Creating new histories if none exist
+        Handles three input cases:
+        1. Single message broadcast: Appends 1 message to ALL active histories.
+        2. Multi-message alignment: Appends message[i] to active history[i].
+        3. Initialization: Creates N new histories if none currently exist.
 
-        Returns:
-            Number of active message histories
+        :param role: The sender role (e.g., userRole, modelRole, systemRole).
+        :param message: A list of message strings to add.
+        :return: Total number of active message histories.
         """
-        ret = 0
-
         if message is None:
             message = []
 
-        # Case 1: Single message broadcast to all histories
+        # Case 1: Broadcast a single prompt to every existing conversation 
+        # thread
         if len(message) == 1 and len(self.messageHistories) > 0:
-            for index in range(0, len(self.messageHistories)):
-                self.messageHistories[index].append({
-                    messageRoleElement : role,
-                    messageTextElement : message[0]
+            for history in self.messageHistories:
+                history.append({
+                    messageRoleElement: role,
+                    messageTextElement: message[0]
                 })
-            ret = len(self.messageHistories)
+
+        # Case 2: Append one distinct message per existing conversation thread
+        elif (len(message) == len(self.messageHistories) and 
+            len(self.messageHistories) > 0):
+            for idx, history in enumerate(self.messageHistories):
+                history.append({
+                    messageRoleElement: role,
+                    messageTextElement: message[idx]
+                })
+
+        # Case 3: Initialize new conversation threads when history is 
+        # currently empty
+        elif len(self.messageHistories) == 0 and len(message) > 0:
+            for msg in message:
+                self.messageHistories.append([{
+                    messageRoleElement: role,
+                    messageTextElement: msg
+                }])
+
+        return len(self.messageHistories)
+
+    def addPromptFromFile(self, index: int, amount: int = -1) -> int:
+        """
+        Reads a prompt template from a file on disk and adds it to the message 
+        histories.
+
+        :param index: Index of the target filename in config.prompt_files.
+        :param amount: Number of duplicate conversation threads to create if 
+            histories are empty.
+        :return: Number of active message histories, or -1 on failure.
+        """
+        l = Logger()
+
+        # Guard Clause: Validate prompt file index bounds
+        if not (0 <= index < len(self.config.prompt_files)):
+            l.log(f"Invalid prompt index: {index}")
+            return -1
+
+        # Guard Clause: Check if prompt folder path is specified
+        if not self.config.prompt_folder:
+            l.log("No prompt folder specified in config.")
+            return -1
+
+        file_name = self.config.prompt_files[index]
+        file_path = Path(self.config.prompt_folder) / file_name
+
+        # Guard Clause: Ensure prompt file exists on disk
+        if not file_path.is_file():
+            l.log(f"File '{file_name}' not found at {file_path}.")
+            return -1
+
+        l.log(f"Loading prompt from file '{file_name}'...")
+        prompt = file_path.read_text(encoding="utf-8")
+        l.log(f"Loaded prompt with base length {len(prompt)}.")
+
+        # Determine how to append/multiply the loaded prompt
+        if len(self.messageHistories) > 0:
+            # If histories already exist, broadcast this prompt as a 
+            # single item
+            prompts = [prompt]
+        elif amount > 0:
+            # If starting fresh, replicate the prompt 'amount' times to 
+            # create N parallel threads
+            prompts = [prompt] * amount
         else:
-            # Case 2: One message per history
-            if len(message) == len(self.messageHistories):
-                for index in range(0, len(self.messageHistories)):
-                    self.messageHistories[index].append({
-                        messageRoleElement : role,
-                        messageTextElement : message[index]
-                    })
-                ret = len(self.messageHistories)
-            else:
-                # Case 3: Initialize histories when none exist
-                if len(self.messageHistories) == 0 and len(message) > 0:
-                    for index in range(0, len(message)):
-                        history = []
-                        history.append({
-                            messageRoleElement : role,
-                            messageTextElement : message[index]
-                        })
-                        self.messageHistories.append(history)
-                    ret = len(self.messageHistories)
+            l.log("Histories empty and valid 'amount' not specified.")
+            return -1
+
+        # Add prompt to history and capture return count
+        ret = self.addPrompt(userRole, prompts)
+        l.log(f"Added {ret} prompt(s) to the model.")
         return ret
 
     def generate(self) -> None:
         """
-        Generate the next assistant response for every stored conversation
-        history, using Gemma-style prompt formatting (<start_of_turn>/
-        <end_of_turn>), and append each response to its history.
-
-        System messages have no dedicated Gemma turn type, so they're
-        folded into the following user turn instead (`s` tracks whether
-        the previous message was a system message still awaiting its
-        user turn to be appended/closed).
+        Formats all message histories using the model's native tokenizer chat 
+        template, runs batch inference through vLLM, and appends outputs back 
+        to histories.
         """
-        inputs = []
-        # Build a prompt for each conversation history
-        for messageHistory in self.messageHistories:
-            prompt = ""
-            s = False # Tracks whether a system message was just processed
-            for message in messageHistory:
-                if message[messageRoleElement] == systemRole:
-                    # System messages are converted into user turns
-                    prompt += f"{startTurn}{userRole}\n" \
-                            f"{message[messageTextElement]}\n\n"
-                    s = True
-                else:
-                    if s:
-                        # Close system-injected user message
-                        prompt +=  f"{message[messageTextElement]}{endTurn}\n"
-                        s = False
-                    else:
-                        # Standard user/assistant turn
-                        prompt += f"{startTurn}{message[messageRoleElement]}\n" \
-                            f"{message[messageTextElement]}{endTurn}\n"
-            # Prepare model to generate the next assistant response
-            prompt += f"{startTurn}{modelRole}"
-            inputs.append(prompt)
+        tokenizer = self.llm.get_tokenizer()
 
-        # Run inference
-        generatedText = self.llm.generate(inputs, self.sampling_params, use_tqdm=False)
-        outputs = []
+        # Pass history dictionaries directly to the template tokenizer
+        formatted_prompts = [
+            tokenizer.apply_chat_template(
+                history,
+                tokenize                = False,
+                add_generation_prompt   = True
+            )
+            for history in self.messageHistories
+        ]
 
-        # Extract and clean generated text
-        for text in generatedText:
-            outputs.append(str(text.outputs[0].text).strip())
+        # Run batched generation
+        generatedText = self.llm.generate(
+            formatted_prompts, 
+            self.sampling_params, 
+            use_tqdm=False
+        )
 
-        # Append model responses to histories
+        # Extract responses and append back to messageHistories
+        outputs = [str(text.outputs[0].text).strip() for text in generatedText]
         self.addPrompt(role = modelRole, message = outputs)
 
-    def getMessageHistories(self) -> list[list[object]]:
+    def getMessageHistories(self) -> list[list[dict]]:
         """
-        Return all stored conversation histories.
+        Returns all current conversation history records.
         """
         return self.messageHistories
 
     def reset(self) -> None:
         """
-        Clear all conversation histories.
+        Clears all active conversation histories and resets state.
         """
         self.messageHistories = []
 
     def logPrompts(self) -> None:
         """
-        Log every prompt from every history to a file, at the path
-        configured by `prompt_log_folder`/`prompt_log_file`.
+        Writes all recorded conversation histories to a log file defined in 
+        the config.
         """
-        path = os.path.join(self.config.prompt_log_folder, self.config.prompt_log_file)
+        path = os.path.join(
+            self.config.prompt_log_folder, 
+            self.config.prompt_log_file
+        )
         writePrompt(path, self.messageHistories)
 
-    def __del__(self) -> None:
+    def close(self) -> None:
         """
-        Destructor to aggressively clean up GPU and distributed resources.
-        Prevents memory leaks and CUDA context issues. Each cleanup step
-        is wrapped individually so that one failing step (e.g. no
-        distributed process group was ever initialized) doesn't stop the
-        remaining steps from running.
+        Explicitly cleans up vLLM engine instances, PyTorch CUDA memory, and 
+        distributed process groups.
+        Helps prevent VRAM leaks when dynamically instantiating or destroying 
+        models.
         """
-        try:
+        if hasattr(self, 'llm') and self.llm is not None:
             del self.llm
-        except:
-            pass
-        try:
+            self.llm = None
+            
+        # Wrap each destruction step to ensure one failure doesn't block 
+        # subsequent cleanup
+        with contextlib.suppress(Exception):
             destroy_model_parallel()
-        except:
-            pass
-        try:
+        with contextlib.suppress(Exception):
             destroy_distributed_environment()
-        except:
-            pass
-        try:
-            with contextlib.suppress(AssertionError):
-                torch.distributed.destroy_process_group()
-        except:
-            pass
-        try:
-            gc.collect()
-        except:
-            pass
-        try:
+        with contextlib.suppress(Exception):
+            torch.distributed.destroy_process_group()
+            
+        gc.collect()
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        except:
-           pass
+
+    def __enter__(self):
+        """Allows usage in context manager blocks (`with Model() as model:`)."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensures GPU resource cleanup when exiting a context manager block."""
+        self.close()
+
+    def __del__(self) -> None:
+        """Fallback destructor call on object garbage collection."""
+        self.close()
