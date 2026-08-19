@@ -239,6 +239,53 @@ class Model:
         l.log(f"Added {ret} prompt(s) to the model.")
         return ret
 
+    def formatPromptFromFile(self, index: int, values: dict) -> int:
+        """
+        Formats an existing prompt template already loaded in the message 
+        histories at the specified index using the provided key-value 
+        dictionary.
+
+        :param index: Index of the message within messageHistories to format.
+            The last message added will be formatted.
+        :param values: Dictionary containing key-value pairs matching {key} 
+            placeholders.
+        :return: Total number of characters added to the prompt, or -1 on 
+            failure.
+        """
+        l = Logger()
+
+        # Guard Clause: Ensure active histories exist
+        if not self.messageHistories:
+            l.log("Cannot format prompt: messageHistories is empty.")
+            return -1
+
+        # Guard Clause: Validate turn index bounds for this history thread
+        if not (0 <= index < len(self.messageHistories)):
+            l.log(f"Turn index {index} out of bounds.")
+            return -1
+
+        history = self.messageHistories[index]
+        message = history[-1]
+
+        raw_template = message[messageTextElement]
+
+        # Step 1: Format template placeholders with dictionary values
+        try:
+            formatted_prompt = raw_template.format(**values)
+        except KeyError as e:
+            l.log(f"Missing template placeholder key in values dict: {e}")
+            return -1
+        except Exception as e:
+            l.log(f"Failed to format prompt template at turn {index}: {e}")
+            return -1
+
+        # Step 2: Update the message content in-place
+        message[messageTextElement] = formatted_prompt
+        history[len(history) - 1] = message 
+        self.messageHistories[index] = history
+
+        return len(formatted_prompt) - len(raw_template)
+
     def generate(self) -> None:
         """
         Formats all message histories using the model's native tokenizer chat 
@@ -261,7 +308,7 @@ class Model:
         generatedText = self.llm.generate(
             formatted_prompts, 
             self.sampling_params, 
-            use_tqdm=False
+            use_tqdm                = False
         )
 
         # Extract responses and append back to messageHistories
