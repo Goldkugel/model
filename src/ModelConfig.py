@@ -77,10 +77,10 @@ class ModelConfig(BaseModel):
         description="Output filename for CSV prompt histories."
     )
 
-    # Target hardware execution device. Restricted strictly to "gpu" or "cpu".
-    device: Literal["gpu", "cpu"] = Field(
-        default="gpu",
-        description="Target execution device platform ('gpu' or 'cpu')."
+    # Target hardware execution device. Restricted strictly to "cuda" or "cpu".
+    device: Literal["cpu", "cuda"] = Field(
+        default="cuda",
+        description="Target execution device platform ('cuda' or 'cpu')."
     )
 
     # Directory containing prompt template files (.md or .txt).
