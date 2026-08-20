@@ -94,3 +94,22 @@ class ModelConfig(BaseModel):
         default_factory=list,
         description="Ordered sequence of prompt template filenames."
     )
+
+    # The file where the temporary data for the prompts are stored.
+    prompt_tmp_file: str = Field(
+        default="raw.tmp",
+        description="Filename for the temporary files created to store the generated text."
+    )
+
+    # The folder where the temporary data is stored.
+    prompt_tmp_folder: str = Field(
+        default="./data/tmp/",
+        description="Directory containing the temporary files."
+    )
+
+    # How many prompts are being processed at one time.
+    chunk_size: int = Field(
+        default=500,
+        gt=0,
+        description="Chunks of prompts processed at the same time. Afterwards the current status is stored in the temporary file."
+    )

@@ -53,15 +53,17 @@ llm:
   model_id: 
     - "google/medgemma-27b-text-it"
   seed: 2898231092
-  device: "gpu"
   temperature: 0.01
   top_p: 0.95
   max_model_len: 8192
   max_num_batched_tokens: 16384
   max_tokens: 2048
+  chunk_size: 500
+  prompt_tmp_folder: "./data/tmp/"
+  prompt_tmp_file: "prompts_raw.tmp"
   prompt_log_folder: "./data/logs/"
   prompt_log_file: "prompts.log"
   prompt_folder: "./prompts/"
-  prompt_order:
+  prompt_files:
     - "first_prompt.md"
     - "second_prompt.md"
