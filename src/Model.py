@@ -76,7 +76,7 @@ class Model:
         l.log(f"Loading model at index {index}: '{model}'...")
 
         device = self.config.device
-        l.log(f"Scanning device {device}...")
+        l.log(f"Scanning device '{device}'...")
 
         # --- Step 3: Check CUDA Availability FIRST ---
         cuda_ok = torch.cuda.is_available()
@@ -93,7 +93,7 @@ class Model:
             l.log("No GPU visible.")
             return
 
-        l.log(f"Scanning device {device} completed.")
+        l.log(f"Scanning device '{device}' completed.")
         
         # --- Step 4: Configure vLLM Sampling Parameters ---
         self.sampling_params = SamplingParams(
@@ -416,6 +416,7 @@ class Model:
 
         df = pd.read_csv(
             target_file,
+            sep=";",
             quoting=csv.QUOTE_ALL
         )
 
