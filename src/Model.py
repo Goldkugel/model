@@ -384,7 +384,8 @@ class Model:
         df = pd.DataFrame(rows_data)
         print(tabulate(df, headers='keys', tablefmt='psql'))
         print(rows_data)
-        print(self.getMessageHistories())
+        print(len(self.getMessageHistories()))
+        print(len(self.getMessageHistories()[0]))
 
         # 5. Ensure directory exists and write to disk
         return writeHugeCSV(df, target_file)
