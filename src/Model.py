@@ -385,7 +385,6 @@ class Model:
         # 4. Merge converted rows into DataFrame
         df = pd.DataFrame(rows_data)
         print(tabulate(df, headers='keys', tablefmt='psql'))
-        print(rows_data)
         print(len(self.getMessageHistories()))
         print(len(self.getMessageHistories()[0]))
 
