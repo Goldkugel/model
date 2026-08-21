@@ -51,7 +51,7 @@ normalizer:
   stop_word_removal: True
 llm:
   model_id: 
-    - "google/medgemma-27b-text-it"
+    - "google/medgemma-4b-it"
   seed: 2898231092
   temperature: 0.01
   top_p: 0.95
@@ -65,5 +65,4 @@ llm:
   prompt_log_file: "prompts.log"
   prompt_folder: "./prompts/"
   prompt_files:
-    - "first_prompt.md"
-    - "second_prompt.md"
+    - "mapping.md"

@@ -10,6 +10,7 @@ from logger             import Logger
 from pathlib            import Path
 from adapter            import writeHugeCSV
 import pandas           as pd
+from tabulate import tabulate
 import logging
 import os
 import contextlib
@@ -21,6 +22,16 @@ import re
 
 # Suppress verbose vLLM initialization and internal status logs
 logging.getLogger("vllm").setLevel(logging.ERROR)
+
+# Ensure CUDA devices are enumerated by PCI bus ID
+# This guarantees consistent GPU ordering across runs
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["VLLM_TARGET_DEVICE"] = "cuda"
+
+# Restrict visible GPUs to those specified in config (e.g. "0,1")
+gpus = int(torch.cuda.device_count())
+if gpus > 0:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in range(0, gpus)])
 
 # Global configuration constants
 # YAML key where LLM config options are stored
@@ -35,27 +46,12 @@ class Model:
     """
 
     def __init__(self, config: str = standard_directory, index: int = 0):
-        """
-        Loads configuration from a YAML file, validates hardware availability, 
-        and initializes the vLLM engine with the selected model.
-
-        :param config: Path to the YAML configuration file.
-        :param index: Index of the model ID to load from the config's model_id 
-            list.
-        """
         l = Logger()
-        
-        # Instance attribute initialization (prevents class-level state sharing)
 
-        # Stores active conversation threads
         self.messageHistories: list[list[dict]] = []  
-        # Holds the active vLLM instance
         self.llm: LLM = None                          
-        # Generation parameters (temp, top_p, max_tokens)
         self.sampling_params: SamplingParams = None   
-        # Identifier/path of the loaded model
         self.model: str = None                        
-        # Validated Pydantic/dataclass configuration
         self.config: ModelConfig = None               
 
         # --- Step 1: Load and Validate Configuration ---
@@ -67,7 +63,6 @@ class Model:
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
             
-        # Parse the 'llm' dictionary section using the ModelConfig validator
         self.config = ModelConfig.model_validate(data[configuration_section])
 
         # --- Step 2: Validate Model Selection Index ---
@@ -82,37 +77,22 @@ class Model:
         device = self.config.device
         l.log(f"Scanning device {device}...")
 
-        # --- Step 3: Configure Hardware Target (GPU vs. CPU) ---
-        gpus = 0
-        if device == gpu:
-            cuda_ok = torch.cuda.is_available()
-            l.log(f"Cuda available: {cuda_ok}.")
-            
-            if not cuda_ok:
-                l.log("No GPU available.")
-                return
+        # --- Step 3: Check CUDA Availability FIRST ---
+        cuda_ok = torch.cuda.is_available()
+        l.log(f"Cuda available: {cuda_ok}.")
+        
+        if not cuda_ok:
+            l.log("No GPU available.")
+            return
 
-            gpus = int(torch.cuda.device_count())
-            l.log(f"GPU Amount: {gpus}.")
+        gpus = torch.cuda.device_count()
+        l.log(f"GPU Amount: {gpus}.")
 
-            if gpus == 0:
-                l.log("No GPU visible.")
-                return
-
-            # Force CUDA to enumerate GPUs by physical PCI bus ID for 
-            # consistent ordering.
-            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-            os.environ[target_device] = gpu
-        else:
-            # Set target device environment variable to CPU.
-            os.environ[target_device] = cpu
+        if gpus == 0:
+            l.log("No GPU visible.")
+            return
 
         l.log(f"Scanning device {device} completed.")
-        l.log(f"Maximum number of batched tokens: " \
-            f"{self.config.max_num_batched_tokens}.")
-        l.log(f"Maximum number of new tokens: {self.config.max_tokens}.")
-        l.log(f"Temperature: {self.config.temperature}.")
-        l.log(f"Max Model Length: {self.config.max_model_len}.")
         
         # --- Step 4: Configure vLLM Sampling Parameters ---
         self.sampling_params = SamplingParams(
@@ -124,27 +104,15 @@ class Model:
         # --- Step 5: Initialize the vLLM Engine ---
         l.log("Loading model...")
         
-        if device == gpu:
-            # Multi-GPU CUDA initialization with Tensor Parallelism.
-            self.llm = LLM(
-                model=model,
-                # Distributes model across all available GPUs.
-                tensor_parallel_size=gpus,  
-                max_model_len=self.config.max_model_len,
-                # Enable expert parallelism only for Mixture-of-Experts (MoE) 
-                # architectures.
-                enable_expert_parallel=("Qwen3-30B" in model)
-            )
-        else:
-            # CPU single-node execution initialization
-            self.llm = LLM(
-                model=model,
-                device=cpu,
-                max_model_len=self.config.max_model_len
-            )
+        self.llm = LLM(
+            model=model,
+            tensor_parallel_size=gpus,  
+            enforce_eager=True,
+            max_model_len=self.config.max_model_len,
+            enable_expert_parallel=("Qwen3-30B" in model)
+        )
 
         l.log(f"Loading model into {device} completed.")
-        l.log(f"Loading model at index {index} completed.")
 
     def addPrompt(self, role: str = userRole, message: list = None) -> int:
         """
@@ -414,6 +382,8 @@ class Model:
 
         # 4. Merge converted rows into DataFrame
         df = pd.DataFrame(rows_data)
+        print(tabulate(df, headers='keys', tablefmt='psql'))
+        print(rows_data)
 
         # 5. Ensure directory exists and write to disk
         return writeHugeCSV(df, target_file)
@@ -609,4 +579,8 @@ class Model:
 
     def __del__(self) -> None:
         """Fallback destructor call on object garbage collection."""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            return
+        return
