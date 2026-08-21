@@ -380,6 +380,8 @@ class Model:
 
                     row_dict[prompt_col] = str(text) if text else ""
 
+            rows_data.append(row_dict)
+
         # 4. Merge converted rows into DataFrame
         df = pd.DataFrame(rows_data)
         print(tabulate(df, headers='keys', tablefmt='psql'))
