@@ -416,7 +416,6 @@ class Model:
 
         df = pd.read_csv(
             target_file,
-            index=False, 
             quoting=csv.QUOTE_ALL
         )
 
