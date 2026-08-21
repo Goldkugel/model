@@ -19,6 +19,7 @@ import torch
 import yaml
 import json
 import re
+import csv
 
 # Suppress verbose vLLM initialization and internal status logs
 logging.getLogger("vllm").setLevel(logging.ERROR)
@@ -413,7 +414,11 @@ class Model:
             l.log(f"File not found at '{target_file}'. Cannot populate messageHistories.")
             return -1
 
-        df = pd.read_csv(target_file)
+        df = pd.read_csv(
+            target_file,
+            index=False, 
+            quoting=csv.QUOTE_ALL
+        )
 
         if df is None or df.empty:
             l.log("DataFrame is empty or None. Cannot populate histories.")
