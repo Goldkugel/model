@@ -113,3 +113,12 @@ class ModelConfig(BaseModel):
         gt=0,
         description="Chunks of prompts processed at the same time. Afterwards the current status is stored in the temporary file."
     )
+
+    # Substrings of model_id that require vLLM's expert-parallel mode, i.e.
+    # Mixture-of-Experts architectures whose experts should be sharded across
+    # the available GPUs. A model is loaded with enable_expert_parallel=True
+    # if any of these substrings appear in its model_id.
+    expert_parallel_models: list[str] = Field(
+        default_factory=lambda: ["Qwen3-30B"],
+        description="Substrings of model_id that require enable_expert_parallel=True (e.g. MoE architectures)."
+    )

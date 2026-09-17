@@ -2,15 +2,22 @@ import sys
 # Prevent Python from writing .pyc bytecode cache files to keep container environments clean
 sys.dont_write_bytecode = True
 
+from typing             import Optional
 from vllm               import LLM, SamplingParams
 from vllm.distributed   import destroy_distributed_environment, destroy_model_parallel
 from .ModelConfig       import ModelConfig
-from .ModelUtils        import *
+from .ModelUtils        import (
+    userRole,
+    modelRole,
+    messageRoleElement,
+    messageTextElement,
+    writePrompt,
+    target_device,
+)
 from logger             import Logger
 from pathlib            import Path
 from adapter            import writeHugeCSV
 import pandas           as pd
-from tabulate import tabulate
 import logging
 import os
 import contextlib
@@ -27,12 +34,15 @@ logging.getLogger("vllm").setLevel(logging.ERROR)
 # Ensure CUDA devices are enumerated by PCI bus ID
 # This guarantees consistent GPU ordering across runs
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["VLLM_TARGET_DEVICE"] = "cuda"
+os.environ[target_device] = "cuda"
 
-# Restrict visible GPUs to those specified in config (e.g. "0,1")
-gpus = int(torch.cuda.device_count())
-if gpus > 0:
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in range(0, gpus)])
+# Expose every CUDA device PyTorch can see to vLLM. This is not config-driven
+# (it runs at import time, before any config file is loaded) -- vLLM is later
+# given tensor_parallel_size=gpus using this same device count, so the two
+# must stay in sync.
+detected_gpu_count = int(torch.cuda.device_count())
+if detected_gpu_count > 0:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(detected_gpu_count))
 
 # Global configuration constants
 # YAML key where LLM config options are stored
@@ -47,13 +57,26 @@ class Model:
     """
 
     def __init__(self, config: str = standard_directory, index: int = 0):
+        """
+        Load and validate configuration, select the model at `index`, and
+        initialize the vLLM engine on GPU.
+
+        :param config: Path to the YAML configuration file containing the
+            "llm" section (validated against ModelConfig).
+        :param index: Index into config.model_id selecting which configured
+            model to load.
+        :raises FileNotFoundError: If the config file does not exist.
+        :raises ValueError: If `index` is out of range for config.model_id.
+        :raises RuntimeError: If no CUDA device is available or visible to
+            PyTorch.
+        """
         l = Logger()
 
-        self.messageHistories: list[list[dict]] = []  
-        self.llm: LLM = None                          
-        self.sampling_params: SamplingParams = None   
-        self.model: str = None                        
-        self.config: ModelConfig = None               
+        self.messageHistories: list[list[dict]] = []
+        self.llm: Optional[LLM] = None
+        self.sampling_params: Optional[SamplingParams] = None
+        self.model: Optional[str] = None
+        self.config: Optional[ModelConfig] = None
 
         # --- Step 1: Load and Validate Configuration ---
         config_path = Path(config)
@@ -63,13 +86,16 @@ class Model:
 
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
-            
+
         self.config = ModelConfig.model_validate(data[configuration_section])
 
         # --- Step 2: Validate Model Selection Index ---
         if not (0 <= index < len(self.config.model_id)):
             l.log(f"No model specified or index {index} out of range.")
-            return
+            raise ValueError(
+                f"Index {index} out of range for config.model_id "
+                f"({len(self.config.model_id)} entries)."
+            )
 
         model = self.config.model_id[index]
         self.model = model
@@ -81,17 +107,17 @@ class Model:
         # --- Step 3: Check CUDA Availability FIRST ---
         cuda_ok = torch.cuda.is_available()
         l.log(f"Cuda available: {cuda_ok}.")
-        
+
         if not cuda_ok:
             l.log("No GPU available.")
-            return
+            raise RuntimeError("No GPU available: CUDA is not accessible to PyTorch.")
 
         gpus = torch.cuda.device_count()
         l.log(f"GPU Amount: {gpus}.")
 
         if gpus == 0:
             l.log("No GPU visible.")
-            return
+            raise RuntimeError("No GPU visible despite CUDA being reported as available.")
 
         l.log(f"Scanning device '{device}' completed.")
         
@@ -107,10 +133,16 @@ class Model:
         
         self.llm = LLM(
             model=model,
-            tensor_parallel_size=gpus,  
+            tensor_parallel_size=gpus,
             enforce_eager=True,
             max_model_len=self.config.max_model_len,
-            enable_expert_parallel=("Qwen3-30B" in model)
+            # Mixture-of-Experts models (configured via
+            # config.expert_parallel_models) need expert parallelism to
+            # shard their experts across the available GPUs; dense models
+            # ignore this flag.
+            enable_expert_parallel=any(
+                pattern in model for pattern in self.config.expert_parallel_models
+            ),
         )
 
         l.log(f"Loading model into {device} completed.")
@@ -131,7 +163,7 @@ class Model:
         if message is None:
             message = []
 
-        # Case 1: Broadcast a single prompt to every existing conversation 
+        # Case 1: Broadcast a single prompt to every existing conversation
         # thread
         if len(message) == 1 and len(self.messageHistories) > 0:
             for history in self.messageHistories:
@@ -141,7 +173,7 @@ class Model:
                 })
 
         # Case 2: Append one distinct message per existing conversation thread
-        elif (len(message) == len(self.messageHistories) and 
+        elif (len(message) == len(self.messageHistories) and
             len(self.messageHistories) > 0):
             for idx, history in enumerate(self.messageHistories):
                 history.append({
@@ -149,7 +181,7 @@ class Model:
                     messageTextElement: message[idx]
                 })
 
-        # Case 3: Initialize new conversation threads when history is 
+        # Case 3: Initialize new conversation threads when history is
         # currently empty
         elif len(self.messageHistories) == 0 and len(message) > 0:
             for msg in message:
@@ -157,6 +189,16 @@ class Model:
                     messageRoleElement: role,
                     messageTextElement: msg
                 }])
+
+        # Invalid combination: message count doesn't broadcast (1), align
+        # 1:1 with existing histories, or initialize from empty histories.
+        # Log and drop rather than silently misaligning conversation threads.
+        elif len(message) > 0:
+            Logger().log(
+                f"addPrompt: message count ({len(message)}) does not match "
+                f"active history count ({len(self.messageHistories)}); no "
+                f"prompt was added."
+            )
 
         return len(self.messageHistories)
 
@@ -252,10 +294,11 @@ class Model:
             l.log(f"Failed to format prompt template at turn {index}: {e}")
             return -1
 
-        # Step 2: Update the message content in-place
+        # Step 2: Update the message content in-place. `message` is the same
+        # dict object as history[-1], which is the same list object as
+        # self.messageHistories[index], so this mutation is already visible
+        # through self.messageHistories.
         message[messageTextElement] = formatted_prompt
-        history[len(history) - 1] = message 
-        self.messageHistories[index] = history
 
         return len(formatted_prompt) - len(raw_template)
 
@@ -327,6 +370,20 @@ class Model:
         l.log("Generation completed successfully for all prompts.")
 
     def _get_column_names(self, turn_idx: int) -> tuple[str, str]:
+        """
+        Derives the (prompt_column, answer_column) name pair for a given
+        turn index, used to keep export/import column naming consistent.
+
+        The prompt column is named after the stem of the corresponding
+        config.prompt_files entry (e.g. "hpo_mapping" for "hpo_mapping.md"),
+        or "prompt{turn_idx + 1}" if no prompt file exists at that index
+        (e.g. for turns added programmatically rather than from a template
+        file). The answer column is the prompt column name with "_answer"
+        appended.
+
+        :param turn_idx: Zero-based index of the prompt/answer turn.
+        :return: Tuple of (prompt_column_name, answer_column_name).
+        """
         prompt_files = self.config.prompt_files
         if turn_idx < len(prompt_files):
             base_name = Path(prompt_files[turn_idx]).stem
@@ -385,9 +442,6 @@ class Model:
 
         # 4. Merge converted rows into DataFrame
         df = pd.DataFrame(rows_data)
-        #print(tabulate(df, headers='keys', tablefmt='psql'))
-        print(len(self.getMessageHistories()))
-        print(len(self.getMessageHistories()[0]))
 
         # 5. Ensure directory exists and write to disk
         return writeHugeCSV(df, target_file)

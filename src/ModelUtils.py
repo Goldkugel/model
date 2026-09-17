@@ -23,48 +23,6 @@ cpu             = "cpu"
 target_device   = "VLLM_TARGET_DEVICE"
 
 # ==============================================================================
-# Raw Special Token Identifiers (Without Enclosing Delimiters)
-# Used to construct exact turn and boundary tokens across distinct model 
-# families.
-# ==============================================================================
-
-# --- Gemma Family Identifiers ---
-startTurnID     = "start_of_turn"
-endTurnID       = "end_of_turn"
-
-# --- Llama Family Identifiers ---
-startHeaderID   = "start_header_id"
-endHeaderID     = "end_header_id"
-endOfTextID     = "eot_id"
-beginOfTextID   = "begin_of_text"
-endOfTextID2    = "end_of_text"
-
-# ==============================================================================
-# Structural Delimiters
-# Characters used to encapsulate raw token IDs into valid special-token tags.
-# ==============================================================================
-startTag        = "<"
-endTag          = ">"
-bar             = "|"
-unusedTokens    = "<unused95>"
-
-# ==============================================================================
-# Fully Formed Special Tokens
-# Assembled token tags corresponding to respective tokenizer template formats.
-# ==============================================================================
-
-# --- Gemma Tag Definitions ---
-startTurn       = f"{startTag}{startTurnID}{endTag}"        # e.g., "<start_of_turn>"
-endTurn         = f"{startTag}{endTurnID}{endTag}"          # e.g., "<end_of_turn>"
-
-# --- Llama Tag Definitions ---
-startHeader     = f"{startTag}{bar}{startHeaderID}{bar}{endTag}"  # e.g., "<|start_header_id|>"
-endHeader       = f"{startTag}{bar}{endHeaderID}{bar}{endTag}"    # e.g., "<|end_header_id|>"
-endOfText       = f"{startTag}{bar}{endOfTextID}{bar}{endTag}"    # e.g., "<|eot_id|>"
-beginOfText     = f"{startTag}{bar}{beginOfTextID}{bar}{endTag}"  # e.g., "<|begin_of_text|>"
-endOfText2      = f"{startTag}{bar}{endOfTextID2}{bar}{endTag}"   # e.g., "<|end_of_text|>"
-
-# ==============================================================================
 # History Key Constants
 # Property dictionary keys used inside message objects passed to writePrompt().
 # ==============================================================================

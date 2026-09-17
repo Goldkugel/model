@@ -1,0 +1,454 @@
+import sys
+
+# Prevent Python bytecode caching
+sys.dont_write_bytecode = True
+
+import os
+
+import pytest
+import torch
+import yaml
+from pydantic import ValidationError
+
+from model            import Model, ModelConfig, messageRoleElement, messageTextElement
+from model.ModelUtils import userRole, modelRole, writePrompt
+
+
+# --- Fixtures ---------------------------------------------------------------
+
+@pytest.fixture
+def model_config_data() -> dict:
+    """Base "llm" config dict matching ModelConfig's schema; override per test."""
+    return {
+        "model_id": ["dummy/model-a", "dummy/model-b"],
+        "seed": 42,
+        "temperature": 0.01,
+        "top_p": 0.95,
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 16384,
+        "max_tokens": 2048,
+        "prompt_log_folder": "./data/logs/",
+        "prompt_log_file": "prompts.log",
+        "device": "cuda",
+        "prompt_folder": "./prompts/",
+        "prompt_files": ["prompt_a.md", "prompt_b.md"],
+        "prompt_tmp_file": "raw.tmp",
+        "prompt_tmp_folder": "./data/tmp/",
+        "chunk_size": 500,
+    }
+
+
+@pytest.fixture
+def bare_model(model_config_data) -> Model:
+    """
+    A Model instance with a validated config but without an actual vLLM
+    engine loaded.
+
+    Model.__init__ requires a real GPU, so tests that only exercise history
+    management (addPrompt, export/import, toJSON, ...) construct the object
+    via __new__ (bypassing __init__) and set up just the state those methods
+    rely on -- config and messageHistories, with llm left as None.
+    """
+    model = Model.__new__(Model)
+    model.config = ModelConfig.model_validate(model_config_data)
+    model.messageHistories = []
+    model.llm = None
+    model.sampling_params = None
+    model.model = model_config_data["model_id"][0]
+    return model
+
+
+def _write_yaml_config(tmp_path, model_config_data: dict) -> str:
+    """Writes model_config_data under the "llm" section to a temp YAML file."""
+    config_path = tmp_path / "config.yaml"
+    with open(config_path, "w") as f:
+        yaml.safe_dump({"llm": model_config_data}, f)
+    return str(config_path)
+
+
+# --- ModelConfig --------------------------------------------------------------
+
+class TestModelConfig:
+
+    def test_config_initializes_with_expected_defaults(self):
+        config = ModelConfig()
+        assert config.model_id == []
+        assert config.device == "cuda"
+        assert config.temperature == 0.01
+        assert config.top_p == 0.95
+        assert config.chunk_size == 500
+        assert config.expert_parallel_models == ["Qwen3-30B"]
+
+    def test_config_rejects_extra_undefined_fields(self):
+        with pytest.raises(ValidationError):
+            ModelConfig(invalid_param=123)  # type: ignore
+
+    def test_config_rejects_temperature_out_of_range(self):
+        with pytest.raises(ValidationError):
+            ModelConfig(temperature=2.5)
+
+    def test_config_rejects_invalid_device(self):
+        with pytest.raises(ValidationError):
+            ModelConfig(device="mps")  # type: ignore
+
+    def test_config_loads_expert_parallel_models_override(self, model_config_data):
+        model_config_data["expert_parallel_models"] = ["Mixtral", "DeepSeek"]
+        config = ModelConfig.model_validate(model_config_data)
+        assert config.expert_parallel_models == ["Mixtral", "DeepSeek"]
+
+
+# --- Model constructor guard clauses -------------------------------------------
+
+class TestModelConstructorGuards:
+    """
+    Exercises the __init__ guard clauses without requiring a real GPU or
+    loading vLLM, by controlling torch.cuda via monkeypatch.
+    """
+
+    def test_raises_file_not_found_for_missing_config(self, tmp_path):
+        missing_path = str(tmp_path / "does_not_exist.yaml")
+        with pytest.raises(FileNotFoundError):
+            Model(config=missing_path)
+
+    def test_raises_value_error_for_out_of_range_index(self, tmp_path, model_config_data):
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        with pytest.raises(ValueError):
+            Model(config=config_path, index=len(model_config_data["model_id"]))
+
+    def test_raises_runtime_error_when_cuda_unavailable(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        with pytest.raises(RuntimeError):
+            Model(config=config_path, index=0)
+
+    def test_raises_runtime_error_when_no_gpu_visible(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+        with pytest.raises(RuntimeError):
+            Model(config=config_path, index=0)
+
+
+# --- Model.addPrompt -----------------------------------------------------------
+
+class TestAddPrompt:
+
+    def test_initializes_new_histories_from_empty(self, bare_model):
+        count = bare_model.addPrompt(userRole, ["prompt a", "prompt b"])
+
+        assert count == 2
+        assert bare_model.messageHistories[0] == [
+            {messageRoleElement: userRole, messageTextElement: "prompt a"}
+        ]
+        assert bare_model.messageHistories[1] == [
+            {messageRoleElement: userRole, messageTextElement: "prompt b"}
+        ]
+
+    def test_broadcasts_single_message_to_all_histories(self, bare_model):
+        bare_model.addPrompt(userRole, ["a", "b"])
+        bare_model.addPrompt(modelRole, ["shared reply"])
+
+        assert bare_model.messageHistories[0][-1] == {
+            messageRoleElement: modelRole, messageTextElement: "shared reply"
+        }
+        assert bare_model.messageHistories[1][-1] == {
+            messageRoleElement: modelRole, messageTextElement: "shared reply"
+        }
+
+    def test_aligns_one_message_per_history(self, bare_model):
+        bare_model.addPrompt(userRole, ["a", "b"])
+        bare_model.addPrompt(modelRole, ["reply a", "reply b"])
+
+        assert bare_model.messageHistories[0][-1][messageTextElement] == "reply a"
+        assert bare_model.messageHistories[1][-1][messageTextElement] == "reply b"
+
+    def test_mismatched_message_count_is_dropped_without_error(self, bare_model):
+        bare_model.addPrompt(userRole, ["a", "b", "c"])
+        count = bare_model.addPrompt(modelRole, ["reply a", "reply b"])
+
+        assert count == 3
+        assert all(len(history) == 1 for history in bare_model.messageHistories)
+
+    def test_none_message_is_a_no_op(self, bare_model):
+        count = bare_model.addPrompt(userRole, None)
+
+        assert count == 0
+        assert bare_model.messageHistories == []
+
+
+# --- Model.addPromptFromFile ----------------------------------------------------
+
+class TestAddPromptFromFile:
+
+    def test_loads_prompt_and_initializes_histories(self, tmp_path, bare_model):
+        prompt_dir = tmp_path / "prompts"
+        prompt_dir.mkdir()
+        (prompt_dir / "prompt_a.md").write_text("Hello {name}", encoding="utf-8")
+
+        bare_model.config.prompt_folder = str(prompt_dir)
+        bare_model.config.prompt_files = ["prompt_a.md"]
+
+        count = bare_model.addPromptFromFile(index=0, amount=2)
+
+        assert count == 2
+        assert len(bare_model.messageHistories) == 2
+        assert bare_model.messageHistories[0][0][messageTextElement] == "Hello {name}"
+
+    def test_invalid_index_returns_negative_one(self, bare_model):
+        assert bare_model.addPromptFromFile(index=5) == -1
+
+    def test_missing_file_returns_negative_one(self, tmp_path, bare_model):
+        bare_model.config.prompt_folder = str(tmp_path)
+        bare_model.config.prompt_files = ["missing.md"]
+
+        assert bare_model.addPromptFromFile(index=0, amount=1) == -1
+
+    def test_empty_prompt_folder_returns_negative_one(self, bare_model):
+        bare_model.config.prompt_folder = ""
+        bare_model.config.prompt_files = ["prompt_a.md"]
+
+        assert bare_model.addPromptFromFile(index=0, amount=1) == -1
+
+
+# --- Model.formatPromptFromFile -------------------------------------------------
+
+class TestFormatPromptFromFile:
+
+    def test_formats_placeholders_in_last_message(self, bare_model):
+        bare_model.addPrompt(userRole, ["Hello {name}, you are {age}"])
+        delta = bare_model.formatPromptFromFile(index=0, values={"name": "Ada", "age": 30})
+
+        formatted = bare_model.messageHistories[0][0][messageTextElement]
+        assert formatted == "Hello Ada, you are 30"
+        assert delta == len(formatted) - len("Hello {name}, you are {age}")
+
+    def test_missing_placeholder_key_returns_negative_one(self, bare_model):
+        bare_model.addPrompt(userRole, ["Hello {name}"])
+        assert bare_model.formatPromptFromFile(index=0, values={}) == -1
+
+    def test_empty_histories_returns_negative_one(self, bare_model):
+        assert bare_model.formatPromptFromFile(index=0, values={}) == -1
+
+    def test_out_of_bounds_index_returns_negative_one(self, bare_model):
+        bare_model.addPrompt(userRole, ["Hello"])
+        assert bare_model.formatPromptFromFile(index=5, values={}) == -1
+
+
+# --- Model._get_column_names ----------------------------------------------------
+
+class TestGetColumnNames:
+
+    def test_uses_prompt_file_stem_when_available(self, bare_model):
+        bare_model.config.prompt_files = ["hpo_mapping.md", "sct_mapping.md"]
+
+        assert bare_model._get_column_names(0) == ("hpo_mapping", "hpo_mapping_answer")
+        assert bare_model._get_column_names(1) == ("sct_mapping", "sct_mapping_answer")
+
+    def test_falls_back_to_generic_name_beyond_configured_files(self, bare_model):
+        bare_model.config.prompt_files = ["hpo_mapping.md"]
+
+        assert bare_model._get_column_names(1) == ("prompt2", "prompt2_answer")
+
+
+# --- Model.exportHistoriesToFile / importHistoriesFromFile ----------------------
+
+class TestExportImportHistoriesRoundTrip:
+
+    def test_round_trip_preserves_prompt_and_answer_pairs(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_tmp_file = "raw.tmp"
+        bare_model.config.prompt_files = ["prompt_a.md"]
+
+        bare_model.addPrompt(userRole, ["What is the capital of France?"])
+        bare_model.addPrompt(modelRole, ["Paris"])
+
+        written = bare_model.exportHistoriesToFile()
+        assert written == 1
+
+        bare_model.messageHistories = []
+        imported = bare_model.importHistoriesFromFile()
+
+        assert imported == 1
+        assert bare_model.messageHistories[0] == [
+            {messageRoleElement: userRole, messageTextElement: "What is the capital of France?"},
+            {messageRoleElement: modelRole, messageTextElement: "Paris"},
+        ]
+
+    def test_export_with_no_histories_returns_negative_one(self, bare_model):
+        assert bare_model.exportHistoriesToFile() == -1
+
+    def test_import_with_missing_file_returns_negative_one(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_tmp_file = "does_not_exist.tmp"
+
+        assert bare_model.importHistoriesFromFile() == -1
+
+
+# --- Model.toJSON ----------------------------------------------------------------
+
+class TestToJSON:
+
+    def test_extracts_json_from_markdown_code_block(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+        bare_model.addPrompt(modelRole, ['Sure, here you go:\n```json\n{"label": "kidney"}\n```'])
+
+        assert bare_model.toJSON(0) == {"label": "kidney"}
+
+    def test_extracts_json_object_without_code_block(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+        bare_model.addPrompt(modelRole, ['The result is {"label": "kidney"} as requested.'])
+
+        assert bare_model.toJSON(0) == {"label": "kidney"}
+
+    def test_returns_none_for_invalid_json(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+        bare_model.addPrompt(modelRole, ["not json at all"])
+
+        assert bare_model.toJSON(0) is None
+
+    def test_returns_none_when_last_message_is_not_from_model(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+
+        assert bare_model.toJSON(0) is None
+
+    def test_returns_none_for_out_of_bounds_index(self, bare_model):
+        assert bare_model.toJSON(0) is None
+
+
+# --- Model.reset / getMessageHistories --------------------------------------------
+
+class TestResetAndGetMessageHistories:
+
+    def test_reset_clears_histories(self, bare_model):
+        bare_model.addPrompt(userRole, ["a"])
+        bare_model.reset()
+
+        assert bare_model.getMessageHistories() == []
+
+
+# --- Model.generate guard clause --------------------------------------------------
+
+class TestGenerateGuardClause:
+
+    def test_returns_immediately_when_no_prompts(self, bare_model):
+        # self.llm is None; if the empty-history guard clause didn't
+        # short-circuit, this would raise AttributeError on
+        # self.llm.get_tokenizer() instead of returning cleanly.
+        assert bare_model.generate() is None
+
+
+# --- Model.logPrompts --------------------------------------------------------------
+
+class TestLogPrompts:
+
+    def test_writes_log_file_at_configured_path(self, tmp_path, bare_model):
+        bare_model.config.prompt_log_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_log_file = "prompts.log"
+        bare_model.addPrompt(userRole, ["Hello"])
+
+        bare_model.logPrompts()
+
+        log_path = tmp_path / "prompts.log"
+        assert log_path.is_file()
+        assert "Hello" in log_path.read_text(encoding="utf-8")
+
+
+# --- Model.close / context manager -------------------------------------------------
+
+class TestClose:
+
+    def test_close_is_safe_to_call_without_a_loaded_llm(self, bare_model):
+        bare_model.close()  # must not raise even though self.llm is None
+        assert bare_model.llm is None
+
+    def test_context_manager_calls_close_on_exit(self, bare_model):
+        with bare_model as m:
+            assert m is bare_model
+        assert bare_model.llm is None
+
+
+# --- ModelUtils.writePrompt ---------------------------------------------------------
+
+class TestWritePrompt:
+
+    def test_writes_header_and_expected_row_count(self, tmp_path):
+        histories = [
+            [
+                {messageRoleElement: userRole, messageTextElement: "Hello"},
+                {messageRoleElement: modelRole, messageTextElement: "Hi there"},
+            ],
+        ]
+        path = str(tmp_path / "logs" / "prompts.log")
+
+        total = writePrompt(path, histories)
+
+        assert total == 2
+        lines = open(path, encoding="utf-8").read().splitlines()
+        assert lines[0] == "history;prompt;role;length;text"
+        assert len(lines) == 3  # header + 2 message rows
+
+    def test_sanitizes_embedded_semicolons_and_newlines(self, tmp_path):
+        histories = [[
+            {messageRoleElement: userRole, messageTextElement: "line one;line two\nline three"}
+        ]]
+        path = str(tmp_path / "prompts.log")
+
+        writePrompt(path, histories)
+
+        content = open(path, encoding="utf-8").read()
+        assert "line one,line two line three" in content
+        assert content.count("\n") == 2  # header + one data row
+
+
+# ==============================================================================
+# Manual Slurm/GPU diagnostic (not a pytest test) -- see src/runTest.sh.
+# Run directly with `python3 src/ModelTest.py` on a GPU node.
+# ==============================================================================
+
+def main():
+    print("=" * 50)
+    print("SLURM & GPU ENVIRONMENT DIAGNOSTIC")
+    print("=" * 50)
+
+    # 1. Check Slurm & CUDA visibility
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "Not Set")
+    print(f"CUDA_VISIBLE_DEVICES : {cuda_visible}")
+
+    cuda_available = torch.cuda.is_available()
+    print(f"PyTorch CUDA Available: {cuda_available}")
+
+    if not cuda_available:
+        print("\n❌ ERROR: CUDA is not available to PyTorch.")
+        print("Check if the CUDA module is loaded or if PyTorch CPU-only is installed.")
+        sys.exit(1)
+
+    device_count = torch.cuda.device_count()
+    device_name = torch.cuda.get_device_name(0)
+    print(f"GPU Device Count     : {device_count}")
+    print(f"Active GPU           : {device_name}")
+
+    print("\n" + "=" * 50)
+    print("INITIALIZING MODEL")
+    print("=" * 50)
+
+    # 2. Instantiate and test your real Model class
+    try:
+        model = Model()
+        print("✅ Model successfully initialized.")
+    except Exception as e:
+        print(f"\n❌ ERROR initializing Model: {e}")
+        sys.exit(1)
+
+    # 3. Clean up resources if your class supports it
+    if hasattr(model, "close"):
+        model.close()
+
+    print("\n🎉 ALL CHECKS PASSED SUCCESSFULLY!")
+
+
+if __name__ == "__main__":
+    main()
