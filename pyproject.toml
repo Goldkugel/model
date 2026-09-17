@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "model"
 description = "vLLM model wrapper for batched prompt management and execution."
 readme = "README.md"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
     "adapter @ git+https://github.com/Goldkugel/adapter.git@v1.1.0",
     "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.6"
