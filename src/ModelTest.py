@@ -11,7 +11,11 @@ import yaml
 from pydantic import ValidationError
 
 from model            import Model, ModelConfig, messageRoleElement, messageTextElement
-from model.ModelUtils import userRole, modelRole, writePrompt
+from model.ModelUtils import systemRole, userRole, modelRole, writePrompt
+
+# The Model module itself (not the class re-exported as `model.Model`), for
+# monkeypatching names it imported from vllm.
+model_module = sys.modules["model.Model"]
 
 
 # --- Fixtures ---------------------------------------------------------------
@@ -131,6 +135,23 @@ class TestModelConstructorGuards:
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
         with pytest.raises(RuntimeError):
             Model(config=config_path, index=0)
+
+    def test_passes_seed_and_batched_tokens_to_vllm(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+        captured = {}
+        monkeypatch.setattr(model_module, "LLM", lambda **kwargs: captured.setdefault("llm", kwargs))
+        monkeypatch.setattr(model_module, "SamplingParams", lambda **kwargs: captured.setdefault("sampling", kwargs))
+
+        Model(config=config_path, index=0)
+
+        assert captured["llm"]["seed"] == model_config_data["seed"]
+        assert captured["llm"]["max_num_batched_tokens"] == model_config_data["max_num_batched_tokens"]
+        assert captured["sampling"]["seed"] == model_config_data["seed"]
 
 
 # --- Model.addPrompt -----------------------------------------------------------
@@ -278,6 +299,58 @@ class TestExportImportHistoriesRoundTrip:
             {messageRoleElement: modelRole, messageTextElement: "Paris"},
         ]
 
+    def test_round_trip_keeps_answers_that_look_like_missing_or_numbers(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_files = ["prompt_a.md"]
+
+        bare_model.addPrompt(userRole, ["q1", "q2", "q3"])
+        bare_model.addPrompt(modelRole, ["NA", "None", "1"])
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.exportHistoriesToFile()
+        bare_model.messageHistories = []
+        bare_model.importHistoriesFromFile()
+
+        assert bare_model.messageHistories == expected
+
+    def test_round_trip_preserves_system_role(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_files = ["prompt_a.md"]
+
+        bare_model.addPrompt(systemRole, ["You are concise."])
+        bare_model.addPrompt(userRole, ["Question"])
+        bare_model.addPrompt(modelRole, ["Answer"])
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.exportHistoriesToFile()
+        bare_model.messageHistories = []
+        bare_model.importHistoriesFromFile()
+
+        assert bare_model.messageHistories == expected
+
+    def test_round_trip_with_non_identifier_prompt_file_name(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_files = ["01_hpo-mapping.md"]
+
+        bare_model.addPrompt(userRole, ["Question"])
+        bare_model.addPrompt(modelRole, ["Answer"])
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.exportHistoriesToFile()
+        bare_model.messageHistories = []
+
+        assert bare_model.importHistoriesFromFile() == 1
+        assert bare_model.messageHistories == expected
+
+    def test_export_leaves_no_temporary_file(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_tmp_file = "raw.tmp"
+
+        bare_model.addPrompt(userRole, ["Question"])
+        bare_model.exportHistoriesToFile()
+
+        assert sorted(os.listdir(tmp_path)) == ["raw.tmp"]
+
     def test_export_with_no_histories_returns_negative_one(self, bare_model):
         assert bare_model.exportHistoriesToFile() == -1
 
@@ -301,6 +374,18 @@ class TestToJSON:
     def test_extracts_json_object_without_code_block(self, bare_model):
         bare_model.addPrompt(userRole, ["classify this"])
         bare_model.addPrompt(modelRole, ['The result is {"label": "kidney"} as requested.'])
+
+        assert bare_model.toJSON(0) == {"label": "kidney"}
+
+    def test_ignores_brackets_in_trailing_prose(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+        bare_model.addPrompt(modelRole, ['{"label": "kidney"}\nNote: see {ref} and [1].'])
+
+        assert bare_model.toJSON(0) == {"label": "kidney"}
+
+    def test_skips_brackets_in_leading_prose(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+        bare_model.addPrompt(modelRole, ['Answer [final]: {"label": "kidney"}'])
 
         assert bare_model.toJSON(0) == {"label": "kidney"}
 
@@ -370,6 +455,19 @@ class TestClose:
             assert m is bare_model
         assert bare_model.llm is None
 
+    def test_garbage_collection_keeps_distributed_environment(self, bare_model, monkeypatch):
+        # Another Model instance may still use the process-wide distributed
+        # environment, so __del__ must not tear it down.
+        calls = []
+        monkeypatch.setattr(model_module, "destroy_model_parallel", lambda: calls.append("parallel"))
+        monkeypatch.setattr(model_module, "destroy_distributed_environment", lambda: calls.append("env"))
+
+        bare_model.llm = object()
+        bare_model.__del__()
+
+        assert bare_model.llm is None
+        assert calls == []
+
 
 # --- ModelUtils.writePrompt ---------------------------------------------------------
 
@@ -435,7 +533,7 @@ def main():
     print("INITIALIZING MODEL")
     print("=" * 50)
 
-    # 2. Instantiate and test your real Model class
+    # 2. Load the first configured model into vLLM
     try:
         model = Model()
         print("✅ Model successfully initialized.")
@@ -443,9 +541,8 @@ def main():
         print(f"\n❌ ERROR initializing Model: {e}")
         sys.exit(1)
 
-    # 3. Clean up resources if your class supports it
-    if hasattr(model, "close"):
-        model.close()
+    # 3. Free GPU memory and shut down vLLM's distributed environment
+    model.close()
 
     print("\n🎉 ALL CHECKS PASSED SUCCESSFULLY!")
 

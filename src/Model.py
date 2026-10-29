@@ -7,16 +7,18 @@ from vllm               import LLM, SamplingParams
 from vllm.distributed   import destroy_distributed_environment, destroy_model_parallel
 from .ModelConfig       import ModelConfig
 from .ModelUtils        import (
+    systemRole,
     userRole,
     modelRole,
     messageRoleElement,
     messageTextElement,
+    systemColumn,
     writePrompt,
+    writeCheckpointCSV,
     target_device,
 )
 from logger             import Logger
 from pathlib            import Path
-from adapter            import writeHugeCSV
 import pandas           as pd
 import logging
 import os
@@ -34,6 +36,7 @@ logging.getLogger("vllm").setLevel(logging.ERROR)
 # Ensure CUDA devices are enumerated by PCI bus ID
 # This guarantees consistent GPU ordering across runs
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# Tell vLLM to use its CUDA backend (CPU execution is not supported yet)
 os.environ[target_device] = "cuda"
 
 # Expose every CUDA device PyTorch can see to vLLM. This is not config-driven
@@ -68,7 +71,8 @@ class Model:
         :raises FileNotFoundError: If the config file does not exist.
         :raises ValueError: If `index` is out of range for config.model_id.
         :raises RuntimeError: If no CUDA device is available or visible to
-            PyTorch.
+            PyTorch. This also applies when config.device is "cpu", since
+            CPU execution is not supported yet.
         """
         l = Logger()
 
@@ -104,7 +108,9 @@ class Model:
         device = self.config.device
         l.log(f"Scanning device '{device}'...")
 
-        # --- Step 3: Check CUDA Availability FIRST ---
+        # --- Step 3: Check CUDA Availability ---
+        # Fail before vLLM is started, which would otherwise abort with a
+        # far less readable error.
         cuda_ok = torch.cuda.is_available()
         l.log(f"Cuda available: {cuda_ok}.")
 
@@ -122,10 +128,13 @@ class Model:
         l.log(f"Scanning device '{device}' completed.")
         
         # --- Step 4: Configure vLLM Sampling Parameters ---
+        # The per-request seed makes each answer reproducible regardless of
+        # how requests are batched.
         self.sampling_params = SamplingParams(
             temperature=self.config.temperature,
             top_p=self.config.top_p,
-            max_tokens=self.config.max_tokens
+            max_tokens=self.config.max_tokens,
+            seed=self.config.seed
         )
 
         # --- Step 5: Initialize the vLLM Engine ---
@@ -133,9 +142,14 @@ class Model:
         
         self.llm = LLM(
             model=model,
+            # Shard the model across all visible GPUs
             tensor_parallel_size=gpus,
+            # Skip CUDA graph capture: slower generation, but faster start-up
+            # and less GPU memory
             enforce_eager=True,
             max_model_len=self.config.max_model_len,
+            max_num_batched_tokens=self.config.max_num_batched_tokens,
+            seed=self.config.seed,
             # Mixture-of-Experts models (configured via
             # config.expert_parallel_models) need expert parallelism to
             # shard their experts across the available GPUs; dense models
@@ -149,7 +163,7 @@ class Model:
 
     def addPrompt(self, role: str = userRole, message: list = None) -> int:
         """
-        Appends user or model messages to the conversation histories.
+        Appends messages with the given role to the conversation histories.
 
         Handles three input cases:
         1. Single message broadcast: Appends 1 message to ALL active histories.
@@ -204,12 +218,14 @@ class Model:
 
     def addPromptFromFile(self, index: int, amount: int = -1) -> int:
         """
-        Reads a prompt template from a file on disk and adds it to the message 
-        histories.
+        Reads a prompt template from a file on disk and adds it to the message
+        histories. The template is always added with the user role and with
+        its {placeholders} unfilled; see formatPromptFromFile().
 
         :param index: Index of the target filename in config.prompt_files.
-        :param amount: Number of duplicate conversation threads to create if 
-            histories are empty.
+        :param amount: Number of duplicate conversation threads to create if
+            histories are empty. Ignored otherwise, as the prompt is then
+            broadcast to every existing history.
         :return: Number of active message histories, or -1 on failure.
         """
         l = Logger()
@@ -256,15 +272,16 @@ class Model:
 
     def formatPromptFromFile(self, index: int, values: dict) -> int:
         """
-        Formats an existing prompt template already loaded in the message 
-        histories at the specified index using the provided key-value 
-        dictionary.
+        Fills the {placeholders} of the last message of one history (usually
+        a template added by addPromptFromFile()) with the provided values.
+        Literal braces in the template must be escaped as {{ and }}.
 
-        :param index: Index of the message within messageHistories to format.
-            The last message added will be formatted.
-        :param values: Dictionary containing key-value pairs matching {key} 
+        :param index: Index of the history within messageHistories whose last
+            message is formatted.
+        :param values: Dictionary containing key-value pairs matching {key}
             placeholders.
-        :return: Total number of characters added to the prompt, or -1 on 
+        :return: Change in the message's length in characters (negative if
+            the values are shorter than their placeholders), or -1 on
             failure.
         """
         l = Logger()
@@ -274,9 +291,9 @@ class Model:
             l.log("Cannot format prompt: messageHistories is empty.")
             return -1
 
-        # Guard Clause: Validate turn index bounds for this history thread
+        # Guard Clause: Validate history index bounds
         if not (0 <= index < len(self.messageHistories)):
-            l.log(f"Turn index {index} out of bounds.")
+            l.log(f"History index {index} out of bounds.")
             return -1
 
         history = self.messageHistories[index]
@@ -291,25 +308,28 @@ class Model:
             l.log(f"Missing template placeholder key in values dict: {e}")
             return -1
         except Exception as e:
-            l.log(f"Failed to format prompt template at turn {index}: {e}")
+            l.log(f"Failed to format prompt template at history {index}: {e}")
             return -1
 
-        # Step 2: Update the message content in-place. `message` is the same
-        # dict object as history[-1], which is the same list object as
-        # self.messageHistories[index], so this mutation is already visible
-        # through self.messageHistories.
+        # Step 2: Update the message content in-place. `message` is the very
+        # dict stored in self.messageHistories[index], so no write-back is
+        # needed.
         message[messageTextElement] = formatted_prompt
 
         return len(formatted_prompt) - len(raw_template)
 
     def generate(self) -> None:
         """
-        Formats message histories using the model's native tokenizer chat template, 
-        runs batched inference through vLLM in configured chunk sizes, appends 
-        outputs back to histories, and persists progress to disk for process resilience.
+        Generates an answer for every history that does not end with a model
+        answer yet. Histories are formatted with the tokenizer's chat
+        template and generated in chunks of config.chunk_size; after every
+        chunk the answers are appended to their histories and all histories
+        are written to the checkpoint file (see exportHistoriesToFile()), so
+        an interrupted run can be resumed with importHistoriesFromFile().
         """
         l = Logger()
 
+        # 1. Nothing to do without prompts
         if len(self.messageHistories) == 0 or len(self.messageHistories[0]) == 0:
             l.log("No prompts available for generation.")
             return
@@ -363,7 +383,8 @@ class Model:
                     messageTextElement: output
                 })
 
-            # 5. Persist progress chunk to file immediately for Slurm fail-safety
+            # 5. Write a checkpoint after every chunk, so a killed job (e.g.
+            # by a Slurm time limit) loses at most one chunk of work
             self.exportHistoriesToFile()
             l.log(f"Batch checkpoint saved.")
 
@@ -393,10 +414,13 @@ class Model:
 
     def exportHistoriesToFile(self) -> int:
         """
-        Transforms current messageHistories into a tabular pandas DataFrame 
-        and persists it to disk.
+        Writes all messageHistories to the checkpoint file
+        (config.prompt_tmp_folder / config.prompt_tmp_file), one row per
+        history. The system prompt is stored in the "system" column; each
+        user prompt and its answer are stored in a prompt/answer column pair
+        named by _get_column_names().
 
-        :return: amount of rows written
+        :return: Number of rows written, or -1 if there are no histories.
         """
         l = Logger()
 
@@ -406,6 +430,7 @@ class Model:
             self.config.prompt_tmp_file
         )
 
+        # 2. Nothing to export without histories
         histories = self.getMessageHistories()
         if not histories:
             l.log("No messageHistories available to export.")
@@ -426,12 +451,16 @@ class Model:
                     _, ans_col = self._get_column_names(prompt_counter)
                     row_dict[ans_col] = str(text).strip() if text else ""
                     prompt_counter += 1
+                elif role == systemRole:
+                    # System prompts get a dedicated column so the import
+                    # can restore them with the system role
+                    row_dict[systemColumn] = str(text) if text else ""
                 else:
-                    # System / User prompts get their own column slot
+                    # User prompts get their own column slot
                     prompt_col, _ = self._get_column_names(prompt_counter)
-                    
-                    # If this slot is already filled (e.g. system prompt followed by user prompt),
-                    # advance to the next column slot
+
+                    # If this slot is already filled (e.g. two consecutive
+                    # user prompts), advance to the next column slot
                     if prompt_col in row_dict:
                         prompt_counter += 1
                         prompt_col, _ = self._get_column_names(prompt_counter)
@@ -443,22 +472,26 @@ class Model:
         # 4. Merge converted rows into DataFrame
         df = pd.DataFrame(rows_data)
 
-        # 5. Ensure directory exists and write to disk
-        return writeHugeCSV(df, target_file)
+        # 5. Write atomically, so an interrupted write never corrupts the
+        # previous checkpoint
+        return writeCheckpointCSV(df, target_file)
 
     def importHistoriesFromFile(self) -> int:
         """
-        Populates self.messageHistories from a pandas DataFrame or directly from 
-        the target CSV log file defined in self.config.
+        Replaces self.messageHistories with the histories stored in the
+        checkpoint file (config.prompt_tmp_folder / config.prompt_tmp_file),
+        as written by exportHistoriesToFile().
 
-        Reconstructs multi-turn conversation histories by mapping tabular column 
-        pairs back into role-message dictionaries.
+        Reconstructs multi-turn conversation histories by mapping the
+        "system" column and the prompt/answer column pairs back into
+        role-message dictionaries. Empty cells are skipped, so a history
+        whose last answer is missing is generated again by generate().
 
         :return: Total number of message histories populated, or -1 on failure.
         """
         l = Logger()
 
-        # 1. Load DataFrame from CSV file if no DataFrame is passed directly
+        # 1. Load the checkpoint file
         target_file = os.path.join(
             self.config.prompt_tmp_folder,
             self.config.prompt_tmp_file
@@ -468,10 +501,15 @@ class Model:
             l.log(f"File not found at '{target_file}'. Cannot populate messageHistories.")
             return -1
 
+        # Read every cell as a literal string: without dtype=str and
+        # keep_default_na=False, answers such as "NA" or "None" would be
+        # parsed as missing (and regenerated), and "1" would become "1.0".
         df = pd.read_csv(
             target_file,
             sep=";",
-            quoting=csv.QUOTE_ALL
+            quoting=csv.QUOTE_ALL,
+            dtype=str,
+            keep_default_na=False
         )
 
         if df is None or df.empty:
@@ -499,27 +537,36 @@ class Model:
         # 3. Reconstruct messageHistories row by row
         new_message_histories = []
 
-        for row in df.itertuples(index=False):
+        # Rows are read as dicts keyed by the exact column names, since
+        # itertuples() renames columns that are not valid Python identifiers
+        # (e.g. "hpo-mapping") and they could then not be looked up.
+        for row in df.to_dict(orient="records"):
             history = []
 
+            # Extract system prompt, which always opens the history
+            system_val = row.get(systemColumn)
+            if pd.notna(system_val) and str(system_val).strip() != "":
+                history.append({
+                    messageRoleElement: systemRole,
+                    messageTextElement: str(system_val)
+                })
+
             for prompt_col, ans_col in column_pairs:
-                # Extract prompt text (User / System)
-                if prompt_col in df.columns:
-                    prompt_val = getattr(row, prompt_col, None)
-                    if pd.notna(prompt_val) and str(prompt_val).strip() != "":
-                        history.append({
-                            messageRoleElement: userRole,
-                            messageTextElement: str(prompt_val)
-                        })
+                # Extract prompt text (User)
+                prompt_val = row.get(prompt_col)
+                if pd.notna(prompt_val) and str(prompt_val).strip() != "":
+                    history.append({
+                        messageRoleElement: userRole,
+                        messageTextElement: str(prompt_val)
+                    })
 
                 # Extract answer text (Model)
-                if ans_col in df.columns:
-                    ans_val = getattr(row, ans_col, None)
-                    if pd.notna(ans_val) and str(ans_val).strip() != "":
-                        history.append({
-                            messageRoleElement: modelRole,
-                            messageTextElement: str(ans_val).strip()
-                        })
+                ans_val = row.get(ans_col)
+                if pd.notna(ans_val) and str(ans_val).strip() != "":
+                    history.append({
+                        messageRoleElement: modelRole,
+                        messageTextElement: str(ans_val).strip()
+                    })
 
             if history:
                 new_message_histories.append(history)
@@ -530,14 +577,15 @@ class Model:
 
         return len(self.messageHistories)
 
-    def toJSON(self, index: int) -> dict:
+    def toJSON(self, index: int) -> Optional[dict | list]:
         """
-        Parses the last generated model response from the history thread at the 
-        given index, extracts a valid JSON object or array substring, and converts 
-        it into a native Python dict.
+        Parses the last generated model response from the history thread at the
+        given index, extracts the first valid JSON object or array, and
+        converts it into a native Python dict or list.
 
         :param index: Index of the target message history.
-        :return: Parsed JSON object (dict), or None if parsing fails.
+        :return: Parsed JSON object (dict) or array (list), or None if
+            parsing fails.
         """
         l = Logger()
 
@@ -567,17 +615,20 @@ class Model:
             except json.JSONDecodeError:
                 pass  # Fall back to regex scan if code block string isn't valid JSON
 
-        # Strategy 2: Search for outermost JSON object {...} or array [...] boundaries
-        json_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
-        if json_match:
-            substring = json_match.group(1).strip()
+        # Strategy 2: Decode the first complete JSON object {...} or array
+        # [...] starting at any opening bracket. raw_decode stops at the end
+        # of the JSON value, so trailing prose (even prose containing
+        # brackets) does not break parsing.
+        decoder = json.JSONDecoder()
+        for bracket in re.finditer(r"[\{\[]", text):
             try:
-                return json.loads(substring)
-            except json.JSONDecodeError as e:
-                l.log(f"Invalid JSON substring found at index {index}: {e}")
-                return None
+                parsed, _ = decoder.raw_decode(text, bracket.start())
+                return parsed
+            except json.JSONDecodeError:
+                continue
 
-        # Strategy 3: Direct fallback parse on raw text
+        # Strategy 3: Parse the whole text, which only succeeds for a bare
+        # JSON scalar such as a number or a string
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -640,9 +691,11 @@ class Model:
         self.close()
 
     def __del__(self) -> None:
-        """Fallback destructor call on object garbage collection."""
-        try:
-            self.close()
-        except Exception:
-            return
-        return
+        """
+        Fallback on object garbage collection: only releases this instance's
+        vLLM engine reference. The distributed environment is process-wide,
+        so tearing it down here would break any other Model instance still
+        alive; that is left to an explicit close() or a `with` block.
+        """
+        with contextlib.suppress(Exception):
+            self.llm = None

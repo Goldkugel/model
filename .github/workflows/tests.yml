@@ -1,0 +1,48 @@
+# Runs the Model test suite on every push and pull request.
+#
+# vllm and torch are not installed: they are several GB in size, need a GPU
+# to be of any use, and the tests do not use them (conftest.py registers
+# stand-ins). The package is therefore installed without its dependencies,
+# and the remaining runtime dependencies are installed explicitly.
+# Tests are run from the repository root because the logger reads
+# ./config/config.yaml.
+
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Pinned instead of ubuntu-latest, as in the logger repository, so the
+    # available Python versions do not change underneath the matrix.
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported (requires-python), the version used by the
+        # pipeline (3.11) and the newest version.
+        python-version: ["3.10", "3.11", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Keep this list in sync with the dependencies in pyproject.toml,
+      # minus vllm and torch.
+      - name: Install package and dependencies (without vllm and torch)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-deps .
+          python -m pip install \
+            "logger @ git+https://github.com/Goldkugel/logger.git@v1.1.0" \
+            pandas "pydantic>=2" pyyaml pytest
+
+      - name: Run tests
+        run: python -m pytest src/ModelTest.py -v

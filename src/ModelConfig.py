@@ -8,9 +8,9 @@ from pydantic   import BaseModel, ConfigDict, Field
 
 class ModelConfig(BaseModel):
     """
-    Pydantic model defining and validating the configuration schema for
-    prompting an LLM (model selection, sampling parameters, and
-    prompt logging).
+    Pydantic model defining and validating the "llm" section of the
+    configuration file: model selection, vLLM engine and sampling
+    parameters, prompt templates, checkpointing and prompt logging.
     """
 
     # Forbid extra fields in the YAML file to catch typos early
@@ -22,7 +22,8 @@ class ModelConfig(BaseModel):
         description="List of HuggingFace or local model repository identifiers."
     )
 
-    # Random seed used for reproducible generation across runs.
+    # Random seed passed to vLLM and to every sampling request, for
+    # reproducible generation across runs.
     seed: int = Field(
         default=2898231092,
         description="Random seed for generation determinism."
@@ -51,7 +52,8 @@ class ModelConfig(BaseModel):
         description="Maximum model context window size in tokens."
     )
 
-    # Maximum number of tokens batched together across concurrent requests (vLLM memory tuning).
+    # Maximum number of tokens vLLM processes in one engine step across
+    # concurrent requests (throughput vs. GPU memory trade-off).
     max_num_batched_tokens: int = Field(
         default=16384,
         gt=0,
@@ -65,22 +67,23 @@ class ModelConfig(BaseModel):
         description="Maximum generation length per request."
     )
 
-    # Directory where prompt log files are saved.
+    # Directory where the prompt log written by Model.logPrompts() is saved.
     prompt_log_folder: str = Field(
         default="./data/logs/",
-        description="Directory target for execution logs."
+        description="Directory of the prompt log file."
     )
 
     # Log filename within `prompt_log_folder`.
     prompt_log_file: str = Field(
         default="prompts.log",
-        description="Output filename for CSV prompt histories."
+        description="Filename of the semicolon-delimited prompt log."
     )
 
-    # Target hardware execution device. Restricted strictly to "cuda" or "cpu".
+    # Target hardware execution device. Only "cuda" is supported yet: "cpu"
+    # passes validation but has no effect, and Model still requires a GPU.
     device: Literal["cpu", "cuda"] = Field(
         default="cuda",
-        description="Target execution device platform ('cuda' or 'cpu')."
+        description="Target execution device; only 'cuda' is supported yet."
     )
 
     # Directory containing prompt template files (.md or .txt).
@@ -95,23 +98,26 @@ class ModelConfig(BaseModel):
         description="Ordered sequence of prompt template filenames."
     )
 
-    # The file where the temporary data for the prompts are stored.
+    # Checkpoint file holding all histories, written after every generation
+    # chunk and read back by Model.importHistoriesFromFile() to resume a run.
     prompt_tmp_file: str = Field(
         default="raw.tmp",
-        description="Filename for the temporary files created to store the generated text."
+        description="Filename of the generation checkpoint."
     )
 
-    # The folder where the temporary data is stored.
+    # Directory where the checkpoint file is stored.
     prompt_tmp_folder: str = Field(
         default="./data/tmp/",
-        description="Directory containing the temporary files."
+        description="Directory of the generation checkpoint."
     )
 
-    # How many prompts are being processed at one time.
+    # Number of histories generated before the next checkpoint is written.
+    # Smaller chunks lose less work when a job is killed, larger chunks
+    # batch more efficiently.
     chunk_size: int = Field(
         default=500,
         gt=0,
-        description="Chunks of prompts processed at the same time. Afterwards the current status is stored in the temporary file."
+        description="Number of histories generated per chunk; a checkpoint is written after every chunk."
     )
 
     # Substrings of model_id that require vLLM's expert-parallel mode, i.e.

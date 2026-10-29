@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generation checkpoints (see data/tmp/README.md)
+*.tmp
+
+# Slurm job output (the folder itself is kept via its README)
+data/slurmlogs/*
+!data/slurmlogs/README.md

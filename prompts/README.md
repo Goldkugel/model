@@ -1,69 +1,47 @@
-Markdown
+# Prompts
 
-# Prompts Directory
+This directory contains the prompt template files (`.md` or `.txt`) loaded by the `Model` class.
 
-This directory contains the prompt template files (`.md` or `.txt`) loaded and processed by the `Model` class during inference.
+| File | Content |
+|---|---|
+| `mapping.md` | Rates the semantic relation between an HPO concept and a SNOMED CT concept; answers with a JSON object `{"mapping_type": ..., "confidence": ...}` |
 
----
+## Configuration
 
-## Directory Structure
-
-Place each prompt template in an individual file within this folder:
-
-```text
-.
-├── config/
-│   └── config.yaml
-├── data/
-│   └── logs/
-├── prompts/
-│   ├── README.md
-│   ├── system_prompt.md
-│   ├── user_prompt_1.md
-│   └── user_prompt_2.md
-└── src/
-```
-
-Usage & Configuration
-
-The order and selection of prompts loaded from this directory are controlled via your config/config.yaml file under the llm section.
-
-## 1. config.yaml Configuration
-
-Specify the directory path and the list of prompt filenames in execution order:
+The prompt files and their order are set in the `llm` section of [`config/config.yaml`](../config/config.yaml). The position in `prompt_files` is the `index` used in code, and the file name (without extension) names the file's columns in the generation checkpoint:
 
 ```yaml
 llm:
   prompt_folder: "./prompts/"
   prompt_files:
-    - "system_prompt.md"
-    - "user_prompt_1.md"
+    - "mapping.md"
 ```
 
-## 2. Loading Prompts in Code
-
-You can load a prompt file into the active conversation history by index matching the list in prompt_files:
+## Loading and filling a prompt
 
 ```python
-
 from model import Model
 
-# Initialize the model using your configuration file
 model = Model(config="./config/config.yaml")
 
-# Load the first prompt file specified in prompt_files (index 0)
-# 'amount' sets the number of parallel conversation histories to create
-model.addPromptFromFile(index=0, amount=1)
+# Load prompt_files[0] into 'amount' new conversation histories
+model.addPromptFromFile(index=0, amount=2)
 
-# Generate response
+# Fill the {placeholders} of history 0 and 1; each dict needs a value for
+# every placeholder of the template (hpo_label, hpo_synonyms, ..., sct_children)
+model.formatPromptFromFile(0, {"hpo_label": "Microcephaly", "sct_term": "Microcephaly"})
+model.formatPromptFromFile(1, {"hpo_label": "Renal dysplasia", "sct_term": "Renal dysplasia"})
+
 model.generate()
-
-# Optional: Log conversations to data/logs/
-model.logPrompts()
 ```
 
-Writing Prompt Templates
+`addPromptFromFile()` always adds the file as a **user** message. To give the model a system prompt, add it directly with `model.addPrompt(role="system", message=[...])` before loading the template.
 
-    - File Format: Files can be plain text (.txt) or Markdown (.md).
-    - Encoding: All files must be UTF-8 encoded.
-    - Content: Write the prompt text directly in the file without hardcoded turn markers (such as <start_of_turn>). The Model class automatically formats messages using the target model's tokenizer chat template.
+If histories already exist, `addPromptFromFile()` adds the prompt to every one of them as the next turn, and `amount` is ignored.
+
+## Writing prompt templates
+
+- **Format:** plain text (`.txt`) or Markdown (`.md`), UTF-8 encoded.
+- **Placeholders:** `{name}` is replaced by `formatPromptFromFile()`; every placeholder in the file needs a value, or formatting fails.
+- **Literal braces:** write `{{` and `}}` for braces that should appear in the prompt, e.g. in a JSON example (see the end of `mapping.md`).
+- **No turn markers:** write only the prompt text, without tokens such as `<start_of_turn>`; `Model` formats messages with the model's own chat template.
