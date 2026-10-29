@@ -5,9 +5,9 @@ The source code of the `model` package (installed from this folder, see `pyproje
 | File | Content |
 |---|---|
 | `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `gpu`, `cpu` |
-| `Model.py` | `Model` class: loads a model into vLLM, manages the conversation histories, fills prompt templates, generates answers in chunks, writes and reads checkpoints, parses JSON answers and frees GPU memory |
+| `Model.py` | `Model` class: loads a model into vLLM, manages the conversation histories, fills prompt templates, generates answers in chunks (skipping prompts longer than the context, logging progress), writes and reads checkpoints, writes the run metadata, parses JSON answers and frees GPU memory |
 | `ModelConfig.py` | `ModelConfig`, the pydantic schema of the `llm` config section |
-| `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log and `writeCheckpointCSV()` for checkpoints |
+| `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log, atomic writers for checkpoints (`writeCheckpointCSV()`) and JSON (`writeJSON()`), and helpers for the run metadata (package versions, model revision, file hashes) |
 | `ModelTest.py` | Pytest suite, plus a GPU diagnostic when run as a script |
 | `runTest.sh` | Slurm job running the GPU diagnostic |
 
@@ -33,7 +33,7 @@ A history is a list of messages in the chat-template format, e.g.:
 ]
 ```
 
-`Model.messageHistories` holds one such list per independent conversation. `generate()` answers every history whose last message is not from the `assistant`.
+`Model.messageHistories` holds one such list per independent conversation. `generate()` answers every history whose last message is not from the `assistant`, except those whose prompt does not fit into `max_model_len` (listed in `Model.skippedHistories`).
 
 ## Tests
 

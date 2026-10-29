@@ -3,7 +3,9 @@ import sys
 # Prevent Python bytecode caching
 sys.dont_write_bytecode = True
 
+import json
 import os
+import types
 
 import pytest
 import torch
@@ -43,7 +45,7 @@ def model_config_data() -> dict:
 
 
 @pytest.fixture
-def bare_model(model_config_data) -> Model:
+def bare_model(model_config_data, tmp_path) -> Model:
     """
     A Model instance with a validated config but without an actual vLLM
     engine loaded.
@@ -55,11 +57,52 @@ def bare_model(model_config_data) -> Model:
     """
     model = Model.__new__(Model)
     model.config = ModelConfig.model_validate(model_config_data)
+    # Keep files written by generate() out of the repository
+    model.config.prompt_tmp_folder = str(tmp_path / "tmp")
+    model.config.metadata_folder = str(tmp_path / "logs")
     model.messageHistories = []
     model.llm = None
     model.sampling_params = None
     model.model = model_config_data["model_id"][0]
+    model.skippedHistories = []
+    model.runId = "test-run"
+    model.runStarted = "2026-01-01T00:00:00+00:00"
+    model.modelIndex = 0
+    model.gpuCount = 0
+    model.generationStats = []
     return model
+
+
+class FakeTokenizer:
+    """Chat-template stand-in: one token per character of every message."""
+
+    def apply_chat_template(self, history, tokenize, add_generation_prompt):
+        assert tokenize and add_generation_prompt
+        return [0] * sum(len(message[messageTextElement]) for message in history)
+
+
+class FakeLLM:
+    """
+    vLLM stand-in for generate(): answers every history with
+    "answer to <last prompt>" and records the size of every chat() batch.
+    """
+
+    def __init__(self):
+        self.batches = []
+
+    def get_tokenizer(self):
+        return FakeTokenizer()
+
+    def chat(self, histories, sampling_params, use_tqdm):
+        self.batches.append(len(histories))
+        results = []
+        for history in histories:
+            text = f"answer to {history[-1][messageTextElement]}"
+            results.append(types.SimpleNamespace(
+                prompt_token_ids=[0] * 10,
+                outputs=[types.SimpleNamespace(text=f"  {text}\n", token_ids=[0] * 3)],
+            ))
+        return results
 
 
 def _write_yaml_config(tmp_path, model_config_data: dict) -> str:
@@ -77,6 +120,12 @@ class TestModelConfig:
     def test_config_initializes_with_expected_defaults(self):
         config = ModelConfig()
         assert config.model_id == []
+        assert config.enforce_eager is True
+        assert config.gpu_memory_utilization == 0.9
+        assert config.dtype == "auto"
+        assert config.quantization is None
+        assert config.enable_prefix_caching is True
+        assert config.metadata_file == "run_metadata.json"
         assert config.device == "cuda"
         assert config.temperature == 0.01
         assert config.top_p == 0.95
@@ -90,6 +139,15 @@ class TestModelConfig:
     def test_config_rejects_temperature_out_of_range(self):
         with pytest.raises(ValidationError):
             ModelConfig(temperature=2.5)
+
+    def test_config_rejects_gpu_memory_utilization_out_of_range(self):
+        with pytest.raises(ValidationError):
+            ModelConfig(gpu_memory_utilization=1.5)
+
+    def test_repository_config_contains_every_option(self):
+        with open("./config/config.yaml", encoding="utf-8") as f:
+            llm_section = yaml.safe_load(f)["llm"]
+        assert set(llm_section) == set(ModelConfig.model_fields)
 
     def test_config_rejects_invalid_device(self):
         with pytest.raises(ValidationError):
@@ -136,9 +194,17 @@ class TestModelConstructorGuards:
         with pytest.raises(RuntimeError):
             Model(config=config_path, index=0)
 
-    def test_passes_seed_and_batched_tokens_to_vllm(
+    def test_passes_engine_options_to_vllm_and_writes_metadata(
         self, tmp_path, model_config_data, monkeypatch
     ):
+        model_config_data.update({
+            "metadata_folder": str(tmp_path / "logs"),
+            "enforce_eager": False,
+            "gpu_memory_utilization": 0.8,
+            "dtype": "bfloat16",
+            "quantization": "fp8",
+            "enable_prefix_caching": False,
+        })
         config_path = _write_yaml_config(tmp_path, model_config_data)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
@@ -149,9 +215,22 @@ class TestModelConstructorGuards:
 
         Model(config=config_path, index=0)
 
-        assert captured["llm"]["seed"] == model_config_data["seed"]
-        assert captured["llm"]["max_num_batched_tokens"] == model_config_data["max_num_batched_tokens"]
+        llm_kwargs = captured["llm"]
+        assert llm_kwargs["seed"] == model_config_data["seed"]
+        assert llm_kwargs["max_num_batched_tokens"] == model_config_data["max_num_batched_tokens"]
+        assert llm_kwargs["enforce_eager"] is False
+        assert llm_kwargs["gpu_memory_utilization"] == 0.8
+        assert llm_kwargs["dtype"] == "bfloat16"
+        assert llm_kwargs["quantization"] == "fp8"
+        assert llm_kwargs["enable_prefix_caching"] is False
         assert captured["sampling"]["seed"] == model_config_data["seed"]
+
+        runs = json.loads((tmp_path / "logs" / "run_metadata.json").read_text(encoding="utf-8"))
+        assert len(runs) == 1
+        assert runs[0]["model"]["id"] == "dummy/model-a"
+        assert runs[0]["gpus"]["count"] == 1
+        assert runs[0]["config"]["dtype"] == "bfloat16"
+        assert runs[0]["generations"] == []
 
 
 # --- Model.addPrompt -----------------------------------------------------------
@@ -187,11 +266,11 @@ class TestAddPrompt:
         assert bare_model.messageHistories[0][-1][messageTextElement] == "reply a"
         assert bare_model.messageHistories[1][-1][messageTextElement] == "reply b"
 
-    def test_mismatched_message_count_is_dropped_without_error(self, bare_model):
+    def test_mismatched_message_count_raises_and_adds_nothing(self, bare_model):
         bare_model.addPrompt(userRole, ["a", "b", "c"])
-        count = bare_model.addPrompt(modelRole, ["reply a", "reply b"])
+        with pytest.raises(ValueError):
+            bare_model.addPrompt(modelRole, ["reply a", "reply b"])
 
-        assert count == 3
         assert all(len(history) == 1 for history in bare_model.messageHistories)
 
     def test_none_message_is_a_no_op(self, bare_model):
@@ -219,20 +298,31 @@ class TestAddPromptFromFile:
         assert len(bare_model.messageHistories) == 2
         assert bare_model.messageHistories[0][0][messageTextElement] == "Hello {name}"
 
-    def test_invalid_index_returns_negative_one(self, bare_model):
-        assert bare_model.addPromptFromFile(index=5) == -1
+    def test_invalid_index_raises(self, bare_model):
+        with pytest.raises(IndexError):
+            bare_model.addPromptFromFile(index=5)
 
-    def test_missing_file_returns_negative_one(self, tmp_path, bare_model):
+    def test_missing_file_raises(self, tmp_path, bare_model):
         bare_model.config.prompt_folder = str(tmp_path)
         bare_model.config.prompt_files = ["missing.md"]
 
-        assert bare_model.addPromptFromFile(index=0, amount=1) == -1
+        with pytest.raises(FileNotFoundError):
+            bare_model.addPromptFromFile(index=0, amount=1)
 
-    def test_empty_prompt_folder_returns_negative_one(self, bare_model):
+    def test_empty_prompt_folder_raises(self, bare_model):
         bare_model.config.prompt_folder = ""
         bare_model.config.prompt_files = ["prompt_a.md"]
 
-        assert bare_model.addPromptFromFile(index=0, amount=1) == -1
+        with pytest.raises(ValueError):
+            bare_model.addPromptFromFile(index=0, amount=1)
+
+    def test_missing_amount_on_empty_histories_raises(self, tmp_path, bare_model):
+        (tmp_path / "prompt_a.md").write_text("Hello", encoding="utf-8")
+        bare_model.config.prompt_folder = str(tmp_path)
+        bare_model.config.prompt_files = ["prompt_a.md"]
+
+        with pytest.raises(ValueError):
+            bare_model.addPromptFromFile(index=0)
 
 
 # --- Model.formatPromptFromFile -------------------------------------------------
@@ -247,16 +337,24 @@ class TestFormatPromptFromFile:
         assert formatted == "Hello Ada, you are 30"
         assert delta == len(formatted) - len("Hello {name}, you are {age}")
 
-    def test_missing_placeholder_key_returns_negative_one(self, bare_model):
+    def test_missing_placeholder_key_raises(self, bare_model):
         bare_model.addPrompt(userRole, ["Hello {name}"])
-        assert bare_model.formatPromptFromFile(index=0, values={}) == -1
+        with pytest.raises(KeyError):
+            bare_model.formatPromptFromFile(index=0, values={})
 
-    def test_empty_histories_returns_negative_one(self, bare_model):
-        assert bare_model.formatPromptFromFile(index=0, values={}) == -1
+    def test_unescaped_brace_raises_value_error(self, bare_model):
+        bare_model.addPrompt(userRole, ["An open { brace"])
+        with pytest.raises(ValueError):
+            bare_model.formatPromptFromFile(index=0, values={})
 
-    def test_out_of_bounds_index_returns_negative_one(self, bare_model):
+    def test_empty_histories_raises(self, bare_model):
+        with pytest.raises(IndexError):
+            bare_model.formatPromptFromFile(index=0, values={})
+
+    def test_out_of_bounds_index_raises(self, bare_model):
         bare_model.addPrompt(userRole, ["Hello"])
-        assert bare_model.formatPromptFromFile(index=5, values={}) == -1
+        with pytest.raises(IndexError):
+            bare_model.formatPromptFromFile(index=5, values={})
 
 
 # --- Model._get_column_names ----------------------------------------------------
@@ -351,14 +449,24 @@ class TestExportImportHistoriesRoundTrip:
 
         assert sorted(os.listdir(tmp_path)) == ["raw.tmp"]
 
-    def test_export_with_no_histories_returns_negative_one(self, bare_model):
-        assert bare_model.exportHistoriesToFile() == -1
+    def test_export_with_no_histories_raises(self, bare_model):
+        with pytest.raises(ValueError):
+            bare_model.exportHistoriesToFile()
 
-    def test_import_with_missing_file_returns_negative_one(self, tmp_path, bare_model):
+    def test_import_with_missing_file_raises(self, tmp_path, bare_model):
         bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
         bare_model.config.prompt_tmp_file = "does_not_exist.tmp"
 
-        assert bare_model.importHistoriesFromFile() == -1
+        with pytest.raises(FileNotFoundError):
+            bare_model.importHistoriesFromFile()
+
+    def test_import_with_empty_file_raises(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_tmp_file = "empty.tmp"
+        (tmp_path / "empty.tmp").write_text("", encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            bare_model.importHistoriesFromFile()
 
 
 # --- Model.toJSON ----------------------------------------------------------------
@@ -400,8 +508,9 @@ class TestToJSON:
 
         assert bare_model.toJSON(0) is None
 
-    def test_returns_none_for_out_of_bounds_index(self, bare_model):
-        assert bare_model.toJSON(0) is None
+    def test_raises_for_out_of_bounds_index(self, bare_model):
+        with pytest.raises(IndexError):
+            bare_model.toJSON(0)
 
 
 # --- Model.reset / getMessageHistories --------------------------------------------
@@ -415,15 +524,109 @@ class TestResetAndGetMessageHistories:
         assert bare_model.getMessageHistories() == []
 
 
-# --- Model.generate guard clause --------------------------------------------------
+# --- Model.generate ------------------------------------------------------------------
 
-class TestGenerateGuardClause:
+class TestGenerate:
 
     def test_returns_immediately_when_no_prompts(self, bare_model):
         # self.llm is None; if the empty-history guard clause didn't
         # short-circuit, this would raise AttributeError on
         # self.llm.get_tokenizer() instead of returning cleanly.
-        assert bare_model.generate() is None
+        assert bare_model.generate() == 0
+
+    def test_answers_unanswered_histories_in_chunks(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.config.chunk_size = 2
+        bare_model.addPrompt(userRole, ["a", "b", "c", "d", "e"])
+        # An already answered history is not sent again
+        bare_model.messageHistories[1].append({messageRoleElement: modelRole, messageTextElement: "done"})
+
+        assert bare_model.generate() == 4
+
+        assert bare_model.llm.batches == [2, 2]
+        assert bare_model.messageHistories[0][-1] == {messageRoleElement: modelRole, messageTextElement: "answer to a"}
+        assert bare_model.messageHistories[1][-1][messageTextElement] == "done"
+        assert all(history[-1][messageRoleElement] == modelRole for history in bare_model.messageHistories)
+        assert os.path.isfile(os.path.join(bare_model.config.prompt_tmp_folder, bare_model.config.prompt_tmp_file))
+
+    def test_skips_prompts_longer_than_the_context(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.config.max_model_len = 10
+        bare_model.addPrompt(userRole, ["short", "x" * 10, "y" * 50])
+
+        assert bare_model.generate() == 1
+
+        assert bare_model.skippedHistories == [1, 2]
+        assert bare_model.llm.batches == [1]
+        assert bare_model.toJSON(1) is None
+        assert bare_model.messageHistories[2] == [{messageRoleElement: userRole, messageTextElement: "y" * 50}]
+
+    def test_chunk_without_fitting_prompts_is_not_sent(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.config.max_model_len = 3
+        bare_model.addPrompt(userRole, ["too long"])
+
+        assert bare_model.generate() == 0
+        assert bare_model.llm.batches == []
+
+    def test_records_statistics_in_run_metadata(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.config.max_model_len = 10
+        bare_model.addPrompt(userRole, ["a", "b", "z" * 20])
+
+        bare_model.generate()
+
+        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        runs = json.loads(open(path, encoding="utf-8").read())
+        stats = runs[0]["generations"][0]
+        assert stats["histories"] == 3
+        assert stats["answers"] == 2
+        assert stats["skipped"] == [2]
+        assert stats["prompt_tokens"] == 20
+        assert stats["generated_tokens"] == 6
+
+
+# --- Model._writeRunMetadata ----------------------------------------------------------
+
+class TestRunMetadata:
+
+    def test_records_prompt_hashes_and_package_versions(self, tmp_path, bare_model):
+        (tmp_path / "prompt_a.md").write_text("Hello", encoding="utf-8")
+        bare_model.config.prompt_folder = str(tmp_path)
+        bare_model.config.prompt_files = ["prompt_a.md", "missing.md"]
+
+        bare_model._writeRunMetadata()
+
+        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        run = json.loads(open(path, encoding="utf-8").read())[0]
+        assert run["prompt_files"] == {
+            # sha256("Hello")
+            "prompt_a.md": "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+            "missing.md": None,
+        }
+        assert run["packages"]["model"] is not None
+        assert run["model"] == {"id": "dummy/model-a", "index": 0, "revision": None}
+
+    def test_keeps_other_runs_and_replaces_its_own(self, bare_model):
+        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        os.makedirs(bare_model.config.metadata_folder)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"run_id": "earlier-run"}], f)
+
+        bare_model._writeRunMetadata()
+        bare_model._writeRunMetadata()
+
+        runs = json.loads(open(path, encoding="utf-8").read())
+        assert [run["run_id"] for run in runs] == ["earlier-run", "test-run"]
+
+    def test_rejects_a_file_that_is_not_a_list(self, bare_model):
+        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        os.makedirs(bare_model.config.metadata_folder)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": "x"}, f)
+
+        with pytest.raises(ValueError):
+            bare_model._writeRunMetadata()
 
 
 # --- Model.logPrompts --------------------------------------------------------------

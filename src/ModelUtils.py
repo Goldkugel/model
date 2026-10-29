@@ -3,8 +3,12 @@ import sys
 # environments clean
 sys.dont_write_bytecode = True
 
-from logger import Logger
-import pandas as pd
+from importlib  import metadata
+from typing     import Optional
+from logger     import Logger
+import pandas   as pd
+import hashlib
+import json
 import os
 import csv
 
@@ -97,15 +101,38 @@ def writePrompt(path: str, histories: list[list[dict]]) -> int:
     return total_written
 
 # ==============================================================================
-# Checkpoint Utilities
+# File Utilities
 # ==============================================================================
+
+def _writeAtomically(path: str, write) -> None:
+    """
+    Calls write(tmp_path) to write the file to "<path>.tmp", which then
+    replaces `path` in a single operation. An interrupted write (e.g. a Slurm
+    job being killed) therefore never leaves a partially written file.
+
+    :param path: Destination file path.
+    :param write: Function writing the complete file to the path it is given.
+    """
+    # Ensure output parent directories exist before writing
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    tmp_path = path + ".tmp"
+    try:
+        write(tmp_path)
+        # os.replace is atomic on both POSIX and Windows
+        os.replace(tmp_path, path)
+    finally:
+        # Only left behind if writing or replacing failed
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 
 def writeCheckpointCSV(data: pd.DataFrame, path: str) -> int:
     """
-    Writes a DataFrame to a semicolon-delimited, fully quoted CSV file
-    atomically: the data is first written to "<path>.tmp", which then replaces
-    `path` in a single operation. An interrupted write (e.g. a Slurm job
-    being killed) therefore never leaves a partially written checkpoint.
+    Writes a DataFrame atomically (see _writeAtomically()) to a
+    semicolon-delimited, fully quoted CSV file.
 
     :param data: DataFrame to write.
     :param path: Destination file path of the checkpoint.
@@ -115,27 +142,82 @@ def writeCheckpointCSV(data: pd.DataFrame, path: str) -> int:
     file_name = os.path.basename(path)
     l.log(f"Writing checkpoint '{file_name}'...")
 
-    # Ensure output parent directories exist before writing
-    parent_dir = os.path.dirname(path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-
-    tmp_path = path + ".tmp"
-    try:
-        data.to_csv(
-            tmp_path,
-            sep=";",
-            encoding="utf-8",
-            index=False,
-            quoting=csv.QUOTE_ALL
-        )
-        # os.replace is atomic on both POSIX and Windows
-        os.replace(tmp_path, path)
-    finally:
-        # Only left behind if writing or replacing failed
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    _writeAtomically(path, lambda tmp_path: data.to_csv(
+        tmp_path,
+        sep=";",
+        encoding="utf-8",
+        index=False,
+        quoting=csv.QUOTE_ALL
+    ))
 
     l.log(f"Writing checkpoint '{file_name}' completed.")
 
     return len(data)
+
+
+def writeJSON(data, path: str) -> None:
+    """
+    Writes a JSON-serializable object atomically (see _writeAtomically()),
+    indented for reading.
+
+    :param data: Object to write.
+    :param path: Destination file path.
+    """
+    def write(tmp_path: str) -> None:
+        with open(tmp_path, mode="w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+
+    _writeAtomically(path, write)
+
+
+# ==============================================================================
+# Run Metadata Utilities
+# ==============================================================================
+
+# Packages whose installed versions are recorded in the run metadata
+metadataPackages = ["model", "logger", "vllm", "torch", "transformers"]
+
+
+def packageVersions(packages: list[str]) -> dict[str, Optional[str]]:
+    """
+    Returns the installed version of every package in `packages`, or None
+    for a package that is not installed.
+    """
+    versions = {}
+    for package in packages:
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def modelRevision(model_id: str) -> Optional[str]:
+    """
+    Returns the Hugging Face commit hash of the locally cached snapshot of
+    `model_id`, i.e. the exact model version vLLM loads. Returns None for a
+    local model directory, or if the snapshot cannot be found.
+    """
+    if os.path.isdir(model_id):
+        return None
+    try:
+        # huggingface_hub is installed with vllm; imported here so the
+        # package still imports without it (e.g. in CI)
+        from huggingface_hub import snapshot_download
+        snapshot = snapshot_download(model_id, local_files_only=True)
+        # Cached snapshots live in .../snapshots/<commit hash>
+        return os.path.basename(os.path.normpath(snapshot))
+    except Exception:
+        return None
+
+
+def fileSHA256(path: str) -> Optional[str]:
+    """
+    Returns the SHA-256 hex digest of the file at `path`, or None if it
+    does not exist.
+    """
+    if not os.path.isfile(path):
+        return None
+    with open(path, mode="rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()

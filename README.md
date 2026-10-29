@@ -7,10 +7,14 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 - **Pydantic-validated configuration** — model selection, sampling parameters and file locations are loaded from YAML and type-checked via `ModelConfig`.
 - **Multi-history chat state** — track many independent conversations at once; add messages by broadcasting to all histories, one per history, or by initializing new histories.
 - **Prompt templates** — load prompt files from `prompts/` and fill their `{placeholder}` fields per history.
-- **Native chat templates** — histories are formatted with the tokenizer's own chat template (`apply_chat_template`), so any chat model supported by vLLM works.
+- **Native chat templates** — histories are sent to vLLM's chat interface (`LLM.chat()`), which formats them with the model's own chat template, so any chat model supported by vLLM works.
 - **Chunked generation with checkpoints** — histories are generated in chunks of `chunk_size`; after every chunk all histories are written atomically to a checkpoint file, from which an interrupted run (e.g. a killed Slurm job) can resume.
+- **Context-length check** — a history whose prompt does not fit into `max_model_len` is skipped (and listed in `skippedHistories`) instead of failing its whole chunk.
+- **Progress logging** — after every chunk the log shows answers and tokens generated, tokens per second, the elapsed time and the estimated remaining time.
+- **Run metadata** — package versions, the model's Hugging Face revision, GPUs, the full configuration, prompt file hashes and generation statistics are written to a JSON file for reproducibility.
 - **Multi-GPU** — all visible GPUs are used via tensor parallelism; Mixture-of-Experts models listed in `expert_parallel_models` additionally get expert parallelism.
 - **JSON extraction** — `toJSON()` parses the JSON object or array from a model answer, with or without a Markdown code block around it.
+- **Errors raise exceptions** — invalid arguments, missing files and mismatched message counts raise an exception instead of returning an error code.
 - **Prompt logging** — write every message of every history to a semicolon-delimited log file.
 
 > **CPU is not supported yet.** `Model` requires at least one CUDA GPU and raises a `RuntimeError` otherwise. The `device` config field accepts `"cpu"`, but this currently has no effect.
@@ -24,7 +28,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 ├── config/
 │   └── config.yaml      # Configuration; Model reads the "llm" section, Logger the "logger" section
 ├── data/
-│   ├── logs/            # Log output (Logger log and prompt log)
+│   ├── logs/            # Log output (Logger log, prompt log and run metadata)
 │   ├── slurmlogs/       # Output of Slurm jobs
 │   └── tmp/             # Generation checkpoints
 ├── prompts/
@@ -33,7 +37,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 │   ├── __init__.py
 │   ├── Model.py         # Model class (chat state, prompting, generation, checkpoints, cleanup)
 │   ├── ModelConfig.py   # Pydantic configuration schema
-│   ├── ModelUtils.py    # Role/device constants, prompt log and checkpoint writers
+│   ├── ModelUtils.py    # Role/device constants, file writers and run metadata helpers
 │   ├── ModelTest.py     # Pytest suite (+ a manual GPU diagnostic, see below)
 │   └── runTest.sh       # Slurm job running the GPU diagnostic
 ├── conftest.py          # Registers stand-ins for vllm and torch when they are not installed
@@ -82,12 +86,19 @@ llm:
   top_p: 0.95
   max_model_len: 8192
   max_num_batched_tokens: 16384
+  enforce_eager: true
+  gpu_memory_utilization: 0.9
+  dtype: "auto"
+  quantization: null
+  enable_prefix_caching: true
   max_tokens: 2048
   chunk_size: 500
   prompt_tmp_folder: "./data/tmp/"
   prompt_tmp_file: "prompts_raw.tmp"
   prompt_log_folder: "./data/logs/"
   prompt_log_file: "prompts.log"
+  metadata_folder: "./data/logs/"
+  metadata_file: "run_metadata.json"
   prompt_folder: "./prompts/"
   prompt_files:
     - "mapping.md"
@@ -101,12 +112,19 @@ llm:
 | `top_p` | `float` | `0.95` | Nucleus sampling probability mass (`>0`–`1.0`). |
 | `max_model_len` | `int` | `8192` | Maximum context length (prompt + generated tokens). |
 | `max_num_batched_tokens` | `int` | `16384` | Maximum number of tokens vLLM batches together per step. |
+| `enforce_eager` | `bool` | `true` | Skip CUDA graph capture: faster start-up and less GPU memory; `false` generates faster. |
+| `gpu_memory_utilization` | `float` | `0.9` | Fraction of each GPU's memory vLLM may use (`>0`–`1.0`). |
+| `dtype` | `str` | `"auto"` | Data type of weights and activations (`"auto"`, `"bfloat16"`, `"float16"`, ...). |
+| `quantization` | `str` \| `null` | `null` | vLLM quantization method (e.g. `"awq"`, `"gptq"`, `"fp8"`); `null` loads the weights as stored. |
+| `enable_prefix_caching` | `bool` | `true` | Reuse the KV cache of shared prompt prefixes, e.g. a common prompt template. |
 | `max_tokens` | `int` | `2048` | Maximum number of generated tokens per answer. |
 | `chunk_size` | `int` | `500` | Number of histories generated before a checkpoint is written. |
 | `prompt_tmp_folder` | `str` | `"./data/tmp/"` | Directory of the checkpoint file. |
 | `prompt_tmp_file` | `str` | `"raw.tmp"` | Checkpoint file name. |
 | `prompt_log_folder` | `str` | `"./data/logs/"` | Directory `logPrompts()` writes to. |
 | `prompt_log_file` | `str` | `"prompts.log"` | File name `logPrompts()` writes to. |
+| `metadata_folder` | `str` | `"./data/logs/"` | Directory of the run metadata file. |
+| `metadata_file` | `str` | `"run_metadata.json"` | Run metadata file name (see [Run metadata](#run-metadata)). |
 | `prompt_folder` | `str` | `"./prompts/"` | Directory of the prompt template files. |
 | `prompt_files` | `list[str]` | `[]` | Prompt template files, in prompting order. |
 | `expert_parallel_models` | `list[str]` | `["Qwen3-30B"]` | Substrings of `model_id` that enable vLLM expert parallelism (MoE models). |
@@ -140,6 +158,8 @@ with Model("./config/config.yaml", index=0) as model:
     # Generate an answer for every history that has none yet.
     model.generate()
 
+    # None for an answer without valid JSON, and for histories in
+    # model.skippedHistories (prompt longer than max_model_len).
     for i in range(len(concepts)):
         print(model.toJSON(i))
 
@@ -156,14 +176,56 @@ model.generate()
 
 ### Resuming an interrupted run
 
-`generate()` writes all histories to `prompt_tmp_folder/prompt_tmp_file` after every chunk. To resume, load that checkpoint and call `generate()` again; histories that already end with an answer are skipped:
+`generate()` writes all histories to `prompt_tmp_folder/prompt_tmp_file` after every chunk. To resume, load that checkpoint and call `generate()` again; histories that already end with an answer are skipped. `importHistoriesFromFile()` raises `FileNotFoundError` if there is no checkpoint, i.e. no earlier run to resume:
 
 ```python
-model.importHistoriesFromFile()
+try:
+    model.importHistoriesFromFile()
+except FileNotFoundError:
+    model.addPromptFromFile(index=0, amount=len(concepts))
+    # ... format the prompts as above
 model.generate()
 ```
 
 The checkpoint is a semicolon-delimited CSV with one row per history: a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files.
+
+### Errors
+
+All methods raise an exception on failure; none returns an error code:
+
+| Method | Raises |
+|---|---|
+| `addPrompt()` | `ValueError` if the number of messages is neither 1, nor the number of histories, nor used to create new histories |
+| `addPromptFromFile()` | `IndexError` for an invalid prompt index, `FileNotFoundError` for a missing prompt file, `ValueError` if `prompt_folder` is empty or `amount` is missing for empty histories |
+| `formatPromptFromFile()` | `IndexError` for an invalid history index, `KeyError` for a placeholder without a value, `ValueError` for a malformed template (e.g. an unescaped `{`) |
+| `exportHistoriesToFile()` | `ValueError` if there are no histories |
+| `importHistoriesFromFile()` | `FileNotFoundError` if there is no checkpoint, `ValueError` if it is empty |
+| `toJSON()` | `IndexError` for an invalid history index; returns `None` if the history has no answer or the answer contains no JSON |
+
+`generate()` returns the number of answers it generated.
+
+### Run metadata
+
+`Model` writes a record of every run to `metadata_folder/metadata_file` when the model is loaded, and updates it after every `generate()` call. The file is a JSON list with one entry per `Model` instance, so resumed runs are appended rather than overwritten:
+
+| Key | Content |
+|---|---|
+| `run_id`, `started`, `updated` | Unique id of the `Model` instance, its start time and the time of the last update |
+| `host`, `slurm_job_id`, `python` | Host name, `SLURM_JOB_ID` (if any) and Python version |
+| `packages` | Installed versions of `model`, `logger`, `vllm`, `torch` and `transformers` |
+| `model` | `model_id`, its index in the config and the Hugging Face commit hash of the cached snapshot (`null` for a local directory) |
+| `gpus` | Number and names of the GPUs and the CUDA version |
+| `prompt_files` | SHA-256 of every configured prompt file (`null` if missing) |
+| `config` | The complete `llm` configuration |
+| `generations` | One entry per `generate()` call: start and end time, duration, number of histories, answers, skipped history indices, prompt and generated tokens |
+
+### Migrating from 1.x
+
+- Methods that returned `-1` now raise an exception (see [Errors](#errors)); replace checks such as `if model.importHistoriesFromFile() > 0:` by `try`/`except FileNotFoundError`.
+- `addPrompt()` with a mismatched number of messages raises `ValueError` instead of logging and adding nothing.
+- `toJSON()` raises `IndexError` for an invalid index instead of returning `None`.
+- `generate()` returns the number of generated answers instead of `None`, and skips prompts longer than `max_model_len` (see `skippedHistories`).
+- New config options: `enforce_eager`, `gpu_memory_utilization`, `dtype`, `quantization`, `enable_prefix_caching`, `metadata_folder`, `metadata_file`. All are optional: `enforce_eager` defaults to the formerly hard-coded `true`, the others to vLLM's usual defaults.
 
 ## Running Unit Tests
 

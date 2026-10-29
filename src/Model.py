@@ -15,13 +15,23 @@ from .ModelUtils        import (
     systemColumn,
     writePrompt,
     writeCheckpointCSV,
+    writeJSON,
+    metadataPackages,
+    packageVersions,
+    modelRevision,
+    fileSHA256,
     target_device,
 )
 from logger             import Logger
 from pathlib            import Path
+from datetime           import datetime
 import pandas           as pd
 import logging
 import os
+import platform
+import socket
+import time
+import uuid
 import contextlib
 import gc
 import torch
@@ -53,6 +63,17 @@ configuration_section: str = "llm"
 # Default path for the configuration file
 standard_directory: str = "./config/config.yaml"  
 
+def _duration(seconds: float) -> str:
+    """Formats a number of seconds as H:MM:SS."""
+    seconds = int(round(seconds))
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def _rate(tokens: int, seconds: float) -> str:
+    """Formats tokens per second, or "-" if no time has passed."""
+    return f"{tokens / seconds:.0f}" if seconds > 0 else "-"
+
+
 class Model:
     """
     Wrapper class around the vLLM engine to manage multi-turn chat sessions,
@@ -81,6 +102,16 @@ class Model:
         self.sampling_params: Optional[SamplingParams] = None
         self.model: Optional[str] = None
         self.config: Optional[ModelConfig] = None
+        # Indices of the histories the last generate() call skipped because
+        # their prompt does not fit into config.max_model_len
+        self.skippedHistories: list[int] = []
+        # Run metadata (see _writeRunMetadata()): one statistics record per
+        # generate() call, under an id unique to this instance
+        self.runId: str = uuid.uuid4().hex
+        self.runStarted: str = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.modelIndex: int = index
+        self.gpuCount: int = 0
+        self.generationStats: list[dict] = []
 
         # --- Step 1: Load and Validate Configuration ---
         config_path = Path(config)
@@ -119,6 +150,7 @@ class Model:
             raise RuntimeError("No GPU available: CUDA is not accessible to PyTorch.")
 
         gpus = torch.cuda.device_count()
+        self.gpuCount = gpus
         l.log(f"GPU Amount: {gpus}.")
 
         if gpus == 0:
@@ -144,12 +176,16 @@ class Model:
             model=model,
             # Shard the model across all visible GPUs
             tensor_parallel_size=gpus,
-            # Skip CUDA graph capture: slower generation, but faster start-up
-            # and less GPU memory
-            enforce_eager=True,
+            # True skips CUDA graph capture: slower generation, but faster
+            # start-up and less GPU memory
+            enforce_eager=self.config.enforce_eager,
             max_model_len=self.config.max_model_len,
             max_num_batched_tokens=self.config.max_num_batched_tokens,
             seed=self.config.seed,
+            gpu_memory_utilization=self.config.gpu_memory_utilization,
+            dtype=self.config.dtype,
+            quantization=self.config.quantization,
+            enable_prefix_caching=self.config.enable_prefix_caching,
             # Mixture-of-Experts models (configured via
             # config.expert_parallel_models) need expert parallelism to
             # shard their experts across the available GPUs; dense models
@@ -161,7 +197,10 @@ class Model:
 
         l.log(f"Loading model into {device} completed.")
 
-    def addPrompt(self, role: str = userRole, message: list = None) -> int:
+        # --- Step 6: Record versions, model revision and GPUs ---
+        self._writeRunMetadata()
+
+    def addPrompt(self, role: str = userRole, message: Optional[list[str]] = None) -> int:
         """
         Appends messages with the given role to the conversation histories.
 
@@ -171,8 +210,12 @@ class Model:
         3. Initialization: Creates N new histories if none currently exist.
 
         :param role: The sender role (e.g., userRole, modelRole, systemRole).
-        :param message: A list of message strings to add.
+        :param message: A list of message strings to add. None or an empty
+            list adds nothing.
         :return: Total number of active message histories.
+        :raises ValueError: If the number of messages neither is 1, nor
+            matches the number of histories, nor initializes empty histories.
+            Nothing is added in that case.
         """
         if message is None:
             message = []
@@ -204,15 +247,15 @@ class Model:
                     messageTextElement: msg
                 }])
 
-        # Invalid combination: message count doesn't broadcast (1), align
-        # 1:1 with existing histories, or initialize from empty histories.
-        # Log and drop rather than silently misaligning conversation threads.
+        # Invalid combination: adding the messages anyway would misalign the
+        # conversation threads.
         elif len(message) > 0:
-            Logger().log(
+            error = (
                 f"addPrompt: message count ({len(message)}) does not match "
-                f"active history count ({len(self.messageHistories)}); no "
-                f"prompt was added."
+                f"active history count ({len(self.messageHistories)})."
             )
+            Logger().log(error)
+            raise ValueError(error)
 
         return len(self.messageHistories)
 
@@ -226,19 +269,27 @@ class Model:
         :param amount: Number of duplicate conversation threads to create if
             histories are empty. Ignored otherwise, as the prompt is then
             broadcast to every existing history.
-        :return: Number of active message histories, or -1 on failure.
+        :return: Number of active message histories.
+        :raises IndexError: If `index` is out of range for
+            config.prompt_files.
+        :raises ValueError: If config.prompt_folder is empty, or if the
+            histories are empty and `amount` is not positive.
+        :raises FileNotFoundError: If the prompt file does not exist.
         """
         l = Logger()
 
         # Guard Clause: Validate prompt file index bounds
         if not (0 <= index < len(self.config.prompt_files)):
             l.log(f"Invalid prompt index: {index}")
-            return -1
+            raise IndexError(
+                f"Prompt index {index} out of range for config.prompt_files "
+                f"({len(self.config.prompt_files)} entries)."
+            )
 
         # Guard Clause: Check if prompt folder path is specified
         if not self.config.prompt_folder:
             l.log("No prompt folder specified in config.")
-            return -1
+            raise ValueError("No prompt folder specified in config.")
 
         file_name = self.config.prompt_files[index]
         file_path = Path(self.config.prompt_folder) / file_name
@@ -246,7 +297,12 @@ class Model:
         # Guard Clause: Ensure prompt file exists on disk
         if not file_path.is_file():
             l.log(f"File '{file_name}' not found at {file_path}.")
-            return -1
+            raise FileNotFoundError(f"Prompt file '{file_name}' not found at {file_path}.")
+
+        # Guard Clause: Without histories, `amount` says how many to create
+        if len(self.messageHistories) == 0 and amount <= 0:
+            l.log("Histories empty and valid 'amount' not specified.")
+            raise ValueError("Histories are empty: 'amount' must be positive.")
 
         l.log(f"Loading prompt from file '{file_name}'...")
         prompt = file_path.read_text(encoding="utf-8")
@@ -257,17 +313,14 @@ class Model:
             # If histories already exist, broadcast this prompt as a 
             # single item
             prompts = [prompt]
-        elif amount > 0:
+        else:
             # If starting fresh, replicate the prompt 'amount' times to 
             # create N parallel threads
             prompts = [prompt] * amount
-        else:
-            l.log("Histories empty and valid 'amount' not specified.")
-            return -1
 
         # Add prompt to history and capture return count
         ret = self.addPrompt(userRole, prompts)
-        l.log(f"Added {ret} prompt(s) to the model.")
+        l.log(f"Added the prompt to {ret} histories.")
         return ret
 
     def formatPromptFromFile(self, index: int, values: dict) -> int:
@@ -281,20 +334,21 @@ class Model:
         :param values: Dictionary containing key-value pairs matching {key}
             placeholders.
         :return: Change in the message's length in characters (negative if
-            the values are shorter than their placeholders), or -1 on
-            failure.
+            the values are shorter than their placeholders).
+        :raises IndexError: If `index` is out of range for messageHistories.
+        :raises KeyError: If `values` has no entry for a placeholder.
+        :raises ValueError: If the template is malformed, e.g. contains an
+            unescaped single brace.
         """
         l = Logger()
-
-        # Guard Clause: Ensure active histories exist
-        if not self.messageHistories:
-            l.log("Cannot format prompt: messageHistories is empty.")
-            return -1
 
         # Guard Clause: Validate history index bounds
         if not (0 <= index < len(self.messageHistories)):
             l.log(f"History index {index} out of bounds.")
-            return -1
+            raise IndexError(
+                f"History index {index} out of range "
+                f"({len(self.messageHistories)} histories)."
+            )
 
         history = self.messageHistories[index]
         message = history[-1]
@@ -306,10 +360,10 @@ class Model:
             formatted_prompt = raw_template.format(**values)
         except KeyError as e:
             l.log(f"Missing template placeholder key in values dict: {e}")
-            return -1
-        except Exception as e:
+            raise
+        except (ValueError, IndexError) as e:
             l.log(f"Failed to format prompt template at history {index}: {e}")
-            return -1
+            raise ValueError(f"Malformed prompt template at history {index}: {e}") from e
 
         # Step 2: Update the message content in-place. `message` is the very
         # dict stored in self.messageHistories[index], so no write-back is
@@ -318,26 +372,30 @@ class Model:
 
         return len(formatted_prompt) - len(raw_template)
 
-    def generate(self) -> None:
+    def generate(self) -> int:
         """
         Generates an answer for every history that does not end with a model
-        answer yet. Histories are formatted with the tokenizer's chat
-        template and generated in chunks of config.chunk_size; after every
-        chunk the answers are appended to their histories and all histories
-        are written to the checkpoint file (see exportHistoriesToFile()), so
-        an interrupted run can be resumed with importHistoriesFromFile().
+        answer yet. Histories are sent to vLLM's chat interface, which
+        formats them with the tokenizer's chat template, in chunks of
+        config.chunk_size; after every chunk the answers are appended to
+        their histories and all histories are written to the checkpoint file
+        (see exportHistoriesToFile()), so an interrupted run can be resumed
+        with importHistoriesFromFile().
+
+        A history whose prompt does not fit into config.max_model_len is
+        skipped instead of failing its whole chunk: it keeps no answer, its
+        index is stored in self.skippedHistories, and toJSON() returns None
+        for it.
+
+        Progress and throughput are logged after every chunk, and the
+        statistics of the call are added to the run metadata file.
+
+        :return: Number of answers generated.
         """
         l = Logger()
+        self.skippedHistories = []
 
-        # 1. Nothing to do without prompts
-        if len(self.messageHistories) == 0 or len(self.messageHistories[0]) == 0:
-            l.log("No prompts available for generation.")
-            return
-
-        tokenizer = self.llm.get_tokenizer()
-        chunk_size = self.config.chunk_size
-
-        # 2. Identify indices where the model has not yet generated a response
+        # 1. Identify indices where the model has not yet generated a response
         # (Histories whose last message role is NOT modelRole)
         unprocessed_indices = [
             idx for idx, history in enumerate(self.messageHistories)
@@ -345,50 +403,183 @@ class Model:
         ]
 
         if not unprocessed_indices:
-            l.log("All prompts already have model generations. Skipping.")
-            return
+            l.log("No histories without an answer; nothing to generate.")
+            return 0
 
-        l.log(f"Starting generation for {len(unprocessed_indices)} unprocessed histories in chunks of {chunk_size}...")
+        tokenizer = self.llm.get_tokenizer()
+        chunk_size = self.config.chunk_size
+        total = len(unprocessed_indices)
+        chunk_count = -(-total // chunk_size)
 
-        # 3. Process inference in chunked batches
-        for i in range(0, len(unprocessed_indices), chunk_size):
-            batch_indices = unprocessed_indices[i : i + chunk_size]
-            
-            # Format chat templates for only the current unprocessed batch
-            formatted_prompts = [
-                tokenizer.apply_chat_template(
-                    self.messageHistories[idx],
-                    tokenize=False,
-                    add_generation_prompt=True
+        l.log(f"Starting generation for {total} unprocessed histories in {chunk_count} chunk(s) of up to {chunk_size}...")
+
+        started = datetime.now().astimezone().isoformat(timespec="seconds")
+        run_start = time.perf_counter()
+        done = 0
+        generated = 0
+        prompt_tokens = 0
+        output_tokens = 0
+
+        # 2. Process inference in chunked batches
+        for chunk_number, i in enumerate(range(0, total, chunk_size), start=1):
+            chunk_indices = unprocessed_indices[i : i + chunk_size]
+            chunk_start = time.perf_counter()
+
+            # Leave out prompts that do not fit into the context window: vLLM
+            # would reject the whole chunk because of a single one of them
+            batch_indices = [idx for idx in chunk_indices if self._fitsContext(tokenizer, idx)]
+            chunk_output_tokens = 0
+
+            if batch_indices:
+                l.log(f"Running vLLM generation for chunk {chunk_number}/{chunk_count} [Indices {batch_indices[0]} to {batch_indices[-1]}]...")
+
+                # Run batched generation over the chat histories
+                results = self.llm.chat(
+                    [self.messageHistories[idx] for idx in batch_indices],
+                    self.sampling_params,
+                    use_tqdm=False
                 )
-                for idx in batch_indices
-            ]
 
-            l.log(f"Running vLLM generation batch [Indices {batch_indices[0]} to {batch_indices[-1]}]...")
+                # 3. Append outputs back to their respective histories
+                for idx, result in zip(batch_indices, results):
+                    completion = result.outputs[0]
+                    self.messageHistories[idx].append({
+                        messageRoleElement: modelRole,
+                        messageTextElement: str(completion.text).strip()
+                    })
+                    prompt_tokens += len(result.prompt_token_ids or [])
+                    chunk_output_tokens += len(completion.token_ids or [])
 
-            # Run batched generation
-            generatedText = self.llm.generate(
-                formatted_prompts,
-                self.sampling_params,
-                use_tqdm=False
+                # 4. Write a checkpoint after every chunk, so a killed job
+                # (e.g. by a Slurm time limit) loses at most one chunk of work
+                self.exportHistoriesToFile()
+
+            output_tokens += chunk_output_tokens
+            done += len(chunk_indices)
+            generated += len(batch_indices)
+
+            # 5. Log progress, throughput and the estimated remaining time
+            chunk_seconds = time.perf_counter() - chunk_start
+            elapsed = time.perf_counter() - run_start
+            remaining = elapsed / done * (total - done)
+            l.log(
+                f"Chunk {chunk_number}/{chunk_count}: {len(batch_indices)} answers, "
+                f"{chunk_output_tokens} tokens in {chunk_seconds:.1f} s "
+                f"({_rate(chunk_output_tokens, chunk_seconds)} tokens/s). "
+                f"Progress: {done}/{total} histories, elapsed {_duration(elapsed)}, "
+                f"remaining ~{_duration(remaining)}."
             )
 
-            # Extract generated response texts
-            outputs = [str(text.outputs[0].text).strip() for text in generatedText]
+        elapsed = time.perf_counter() - run_start
+        if self.skippedHistories:
+            l.log(f"Skipped {len(self.skippedHistories)} histories whose prompt exceeds max_model_len: {self.skippedHistories}")
+        l.log(
+            f"Generation completed: {generated} answers, {prompt_tokens} prompt "
+            f"and {output_tokens} generated tokens in {_duration(elapsed)} "
+            f"({_rate(output_tokens, elapsed)} generated tokens/s)."
+        )
 
-            # 4. Append outputs back to their respective histories
-            for idx, output in zip(batch_indices, outputs):
-                self.messageHistories[idx].append({
-                    messageRoleElement: modelRole,
-                    messageTextElement: output
-                })
+        # 6. Record the statistics of this call in the run metadata
+        self.generationStats.append({
+            "started": started,
+            "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "seconds": round(elapsed, 1),
+            "histories": total,
+            "answers": generated,
+            "skipped": list(self.skippedHistories),
+            "prompt_tokens": prompt_tokens,
+            "generated_tokens": output_tokens,
+        })
+        self._writeRunMetadata()
 
-            # 5. Write a checkpoint after every chunk, so a killed job (e.g.
-            # by a Slurm time limit) loses at most one chunk of work
-            self.exportHistoriesToFile()
-            l.log(f"Batch checkpoint saved.")
+        return generated
 
-        l.log("Generation completed successfully for all prompts.")
+    def _fitsContext(self, tokenizer, index: int) -> bool:
+        """
+        Returns whether the prompt of the history at `index`, formatted with
+        the chat template, leaves room for at least one generated token
+        within config.max_model_len. Otherwise the index is added to
+        self.skippedHistories.
+        """
+        token_ids = tokenizer.apply_chat_template(
+            self.messageHistories[index],
+            tokenize=True,
+            add_generation_prompt=True
+        )
+        # Some transformers versions return a BatchEncoding instead of a list
+        if hasattr(token_ids, "keys"):
+            token_ids = token_ids["input_ids"]
+
+        if len(token_ids) < self.config.max_model_len:
+            return True
+
+        Logger().log(
+            f"Skipping history {index}: its prompt has {len(token_ids)} tokens, "
+            f"max_model_len is {self.config.max_model_len}."
+        )
+        self.skippedHistories.append(index)
+        return False
+
+    def _writeRunMetadata(self) -> None:
+        """
+        Writes this run's metadata to config.metadata_folder /
+        config.metadata_file: package versions, the model and its Hugging
+        Face revision, GPUs, host, the full config, the SHA-256 of every
+        prompt file and the statistics of every generate() call.
+
+        The file holds a JSON list with one entry per Model instance (keyed
+        by self.runId); this instance's entry is replaced, all others are
+        kept, so resumed runs append to the same file.
+
+        :raises ValueError: If the existing file is not a JSON list.
+        """
+        path = os.path.join(self.config.metadata_folder, self.config.metadata_file)
+
+        runs = []
+        if os.path.isfile(path):
+            with open(path, mode="r", encoding="utf-8") as f:
+                runs = json.load(f)
+            if not isinstance(runs, list):
+                raise ValueError(f"Run metadata file '{path}' does not contain a JSON list.")
+
+        gpu_names = []
+        for gpu_index in range(self.gpuCount):
+            try:
+                gpu_names.append(torch.cuda.get_device_name(gpu_index))
+            except Exception:
+                gpu_names.append(None)
+
+        prompt_hashes = {
+            file_name: fileSHA256(os.path.join(self.config.prompt_folder, file_name))
+            for file_name in self.config.prompt_files
+        }
+
+        record = {
+            "run_id": self.runId,
+            "started": self.runStarted,
+            "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "host": socket.gethostname(),
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+            "python": platform.python_version(),
+            "packages": packageVersions(metadataPackages),
+            "model": {
+                "id": self.model,
+                "index": self.modelIndex,
+                "revision": modelRevision(self.model),
+            },
+            "gpus": {
+                "count": self.gpuCount,
+                "names": gpu_names,
+                "cuda": getattr(getattr(torch, "version", None), "cuda", None),
+            },
+            "prompt_files": prompt_hashes,
+            "config": self.config.model_dump(),
+            "generations": self.generationStats,
+        }
+
+        runs = [run for run in runs if run.get("run_id") != self.runId]
+        runs.append(record)
+        writeJSON(runs, path)
 
     def _get_column_names(self, turn_idx: int) -> tuple[str, str]:
         """
@@ -420,7 +611,8 @@ class Model:
         user prompt and its answer are stored in a prompt/answer column pair
         named by _get_column_names().
 
-        :return: Number of rows written, or -1 if there are no histories.
+        :return: Number of rows written.
+        :raises ValueError: If there are no histories.
         """
         l = Logger()
 
@@ -434,7 +626,7 @@ class Model:
         histories = self.getMessageHistories()
         if not histories:
             l.log("No messageHistories available to export.")
-            return -1
+            raise ValueError("No message histories to export.")
 
         # 3. Transform histories into row dictionaries
         rows_data = []
@@ -487,7 +679,11 @@ class Model:
         role-message dictionaries. Empty cells are skipped, so a history
         whose last answer is missing is generated again by generate().
 
-        :return: Total number of message histories populated, or -1 on failure.
+        :return: Total number of message histories populated.
+        :raises FileNotFoundError: If the checkpoint file does not exist,
+            e.g. because no earlier run was interrupted.
+        :raises ValueError: If the checkpoint is empty or has no
+            prompt/answer columns.
         """
         l = Logger()
 
@@ -499,22 +695,25 @@ class Model:
 
         if not os.path.exists(target_file):
             l.log(f"File not found at '{target_file}'. Cannot populate messageHistories.")
-            return -1
+            raise FileNotFoundError(f"Checkpoint file not found at '{target_file}'.")
 
         # Read every cell as a literal string: without dtype=str and
         # keep_default_na=False, answers such as "NA" or "None" would be
         # parsed as missing (and regenerated), and "1" would become "1.0".
-        df = pd.read_csv(
-            target_file,
-            sep=";",
-            quoting=csv.QUOTE_ALL,
-            dtype=str,
-            keep_default_na=False
-        )
+        try:
+            df = pd.read_csv(
+                target_file,
+                sep=";",
+                quoting=csv.QUOTE_ALL,
+                dtype=str,
+                keep_default_na=False
+            )
+        except pd.errors.EmptyDataError:
+            df = None
 
         if df is None or df.empty:
             l.log("DataFrame is empty or None. Cannot populate histories.")
-            return -1
+            raise ValueError(f"Checkpoint file '{target_file}' contains no histories.")
 
         # 2. Identify all prompt/answer column pairs present in the DataFrame
         column_pairs = []
@@ -532,7 +731,7 @@ class Model:
 
         if not column_pairs:
             l.log("No valid prompt/answer columns found in DataFrame.")
-            return -1
+            raise ValueError(f"Checkpoint file '{target_file}' has no prompt/answer columns.")
 
         # 3. Reconstruct messageHistories row by row
         new_message_histories = []
@@ -584,15 +783,20 @@ class Model:
         converts it into a native Python dict or list.
 
         :param index: Index of the target message history.
-        :return: Parsed JSON object (dict) or array (list), or None if
-            parsing fails.
+        :return: Parsed JSON value, or None if the history has no answer
+            (e.g. it was skipped by generate()) or the answer contains no
+            valid JSON.
+        :raises IndexError: If `index` is out of range for messageHistories.
         """
         l = Logger()
 
-        # Guard Clause: Ensure messageHistories exists and index is within bounds
-        if not self.messageHistories or not (0 <= index < len(self.messageHistories)):
+        # Guard Clause: Ensure the index is within bounds
+        if not (0 <= index < len(self.messageHistories)):
             l.log(f"History index {index} out of bounds.")
-            return None
+            raise IndexError(
+                f"History index {index} out of range "
+                f"({len(self.messageHistories)} histories)."
+            )
 
         history = self.messageHistories[index]
         

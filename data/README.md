@@ -4,7 +4,7 @@ Output written while running `Model`. The locations of `logs/` and `tmp/` are se
 
 ```
 data/
-├── logs/       # Run log (logger) and prompt log (Model.logPrompts())
+├── logs/       # Run log (logger), prompt log (Model.logPrompts()) and run metadata
 ├── slurmlogs/  # Output of Slurm jobs (src/runTest.sh)
 └── tmp/        # Generation checkpoint (Model.generate())
 ```

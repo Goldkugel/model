@@ -3,7 +3,7 @@ import sys
 # Prevent Python from writing .pyc bytecode cache files to keep container environments clean
 sys.dont_write_bytecode = True
 
-from typing     import Literal
+from typing     import Literal, Optional
 from pydantic   import BaseModel, ConfigDict, Field
 
 class ModelConfig(BaseModel):
@@ -60,6 +60,42 @@ class ModelConfig(BaseModel):
         description="vLLM batch engine token throughput limit."
     )
 
+    # Skip CUDA graph capture. True starts faster and needs less GPU memory,
+    # False generates faster once the model is loaded.
+    enforce_eager: bool = Field(
+        default=True,
+        description="Run vLLM in eager mode without CUDA graphs."
+    )
+
+    # Fraction of every GPU's memory vLLM may use for weights and KV cache.
+    gpu_memory_utilization: float = Field(
+        default=0.9,
+        gt=0.0,
+        le=1.0,
+        description="Fraction of GPU memory reserved by vLLM."
+    )
+
+    # Data type of weights and activations, e.g. "auto" (as in the model's
+    # config), "bfloat16", "float16".
+    dtype: str = Field(
+        default="auto",
+        description="Data type of the model weights and activations."
+    )
+
+    # Quantization method, e.g. "awq", "gptq", "fp8"; null loads the weights
+    # as stored (vLLM detects pre-quantized checkpoints itself).
+    quantization: Optional[str] = Field(
+        default=None,
+        description="Quantization method passed to vLLM, or null."
+    )
+
+    # Reuse the KV cache of shared prompt prefixes across requests, which
+    # speeds up histories that start with the same prompt template.
+    enable_prefix_caching: bool = Field(
+        default=True,
+        description="Reuse the KV cache of common prompt prefixes."
+    )
+
     # Maximum number of new tokens generated per output sequence.
     max_tokens: int = Field(
         default=2048,
@@ -84,6 +120,20 @@ class ModelConfig(BaseModel):
     device: Literal["cpu", "cuda"] = Field(
         default="cuda",
         description="Target execution device; only 'cuda' is supported yet."
+    )
+
+    # Directory of the run metadata file (versions, model revision, GPUs,
+    # config, prompt file hashes and generation statistics).
+    metadata_folder: str = Field(
+        default="./data/logs/",
+        description="Directory of the run metadata file."
+    )
+
+    # Run metadata filename within `metadata_folder`. Holds a JSON list with
+    # one entry per Model instance.
+    metadata_file: str = Field(
+        default="run_metadata.json",
+        description="Filename of the run metadata JSON file."
     )
 
     # Directory containing prompt template files (.md or .txt).
