@@ -220,7 +220,9 @@ answer["reasoning"]   # the reasoning (key missing for non-thinking answers)
 
 **Settings.** For hybrid models such as Qwen3, `enable_thinking: false` switches thinking off and `true` switches it on; the setting is passed both to `LLM.chat()` and to the context-length check. Reasoning counts towards `max_tokens`, so thinking models need a much larger value (e.g. 8192–32768) and a `max_model_len` that fits prompt plus output. Most model cards also recommend `temperature: 0.6` and `top_p: 0.95` instead of near-greedy decoding, which tends to make the reasoning repeat itself.
 
-**Cut-off answers.** Every answer that stopped at `max_tokens` is listed in `model.truncatedHistories` and in the run metadata. A thinking model cut off during its reasoning gets an empty answer (`toJSON()` returns `None`); the next `generate()` call, also after resuming from the checkpoint, replaces it by a new answer. With the same seed and settings the new answer is cut off again, so raise `max_tokens` first. Until then, `addPrompt()` refuses to add another turn to such a history, since the checkpoint cannot store the empty answer between two prompts. With DeepSeek-R1-style templates, an output cut off before `</think>` contains no tag at all, so it is stored as the answer; it is still listed in `truncatedHistories`.
+**Cut-off answers.** Every answer that stopped at `max_tokens` is listed in `model.truncatedHistories` and in the run metadata. A thinking model cut off during its reasoning gets an empty answer (`toJSON()` returns `None`); the next `generate()` call, also after resuming from the checkpoint, replaces it by a new answer. With the same seed and settings the new answer is cut off again, so raise `max_tokens` first. Until then, `addPrompt()` refuses to add another turn to such a history, since the checkpoint cannot store the empty answer between two prompts. With DeepSeek-R1-style templates, which open the reasoning in the prompt, an output cut off before `</think>` contains no tag at all; it is recognised from the template and also stored as reasoning with an empty answer.
+
+Cut-off answers are marked with `"truncated": True` on the message (`messageTruncatedElement`), also in the checkpoint. `toJSON()` then only accepts a JSON value that starts at the answer's first bracket, so a cut-off array such as `[{...}, {"label": "li` yields `None`, not its first element.
 
 Models that use OpenAI's "harmony" format (gpt-oss) put their reasoning into a separate channel instead of `<think>` tags and are not supported yet.
 
@@ -237,7 +239,9 @@ except FileNotFoundError:
 model.generate()
 ```
 
-The checkpoint is a semicolon-delimited CSV with one row per history: a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files. The reasoning of thinking models is stored in an extra `mapping_reasoning` column (only present if some answer of that turn has reasoning) and restored on import. Since the column names are derived from `prompt_files`, resume with the same `prompt_files` the checkpoint was written with.
+**One checkpoint per run.** Runs that would write the same checkpoint at the same time, e.g. two models or the jobs of a Slurm job array started with one config, would overwrite each other's work. `generate()` and `exportHistoriesToFile()` therefore only write a checkpoint that does not exist yet, or that this `Model` wrote or imported itself and nobody changed since; otherwise they raise `RuntimeError` before generating anything. Give every concurrent run its own `prompt_tmp_file`, resume a checkpoint with `importHistoriesFromFile()`, or delete it to start over. The checkpoint also records the model, and `importHistoriesFromFile()` refuses one written with another model.
+
+The checkpoint is a semicolon-delimited CSV with one row per history: a `_model` column with the model, a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files. The reasoning of thinking models is stored in an extra `mapping_reasoning` column and cut-off answers are marked in `mapping_truncated` (each only present if some answer of that turn needs it); both are restored on import. Since the column names are derived from `prompt_files`, resume with the same `prompt_files` the checkpoint was written with.
 
 ### Errors
 
@@ -246,12 +250,12 @@ All methods raise an exception on failure; none returns an error code:
 | Method | Raises |
 |---|---|
 | `Model()` | `FileNotFoundError` for a missing config file, `KeyError` if it has no `llm` section, `pydantic.ValidationError` for unknown keys or invalid values, `ValueError` for an invalid model index, `RuntimeError` if no CUDA device is visible |
-| `addPrompt()` | `TypeError` if `message` is a string instead of a list; `ValueError` for an unknown role, if the number of messages is neither 1, nor the number of histories, nor used to create new histories, or if a history ends with an empty answer |
+| `addPrompt()` | `TypeError` if `message` is a string instead of a list; `ValueError` for an unknown role, if the number of messages is neither 1, nor the number of histories, nor used to create new histories, if a history ends with an empty answer, or if an answer (`"assistant"`) would not follow a user prompt |
 | `addPromptFromFile()` | `IndexError` for an invalid prompt index, `FileNotFoundError` for a missing prompt file, `ValueError` if `prompt_folder` is empty or `amount` is missing for empty histories |
 | `formatPromptFromFile()` | `IndexError` for an invalid history index, `KeyError` for a placeholder without a value, `ValueError` for a malformed template (e.g. an unescaped `{`) |
-| `exportHistoriesToFile()` | `ValueError` if there are no histories |
-| `importHistoriesFromFile()` | `FileNotFoundError` if there is no checkpoint, `ValueError` if it is empty |
-| `generate()` | `RuntimeError` if the model was closed with `close()` |
+| `exportHistoriesToFile()` | `ValueError` if there are no histories, `RuntimeError` if the checkpoint belongs to another run |
+| `importHistoriesFromFile()` | `FileNotFoundError` if there is no checkpoint, `ValueError` if it is empty or was written with another model |
+| `generate()` | `RuntimeError` if the model was closed with `close()`, or if the checkpoint belongs to another run |
 | `toJSON()` | `IndexError` for an invalid history index; returns `None` if the history has no answer or the answer contains no JSON |
 
 `generate()` returns the number of answers it generated.
@@ -260,7 +264,7 @@ Failures that do not stop a run are written to the log instead: a cleanup step o
 
 ### Run metadata
 
-`Model` writes a record of every run to `metadata_folder/metadata_file` when the model is loaded, and updates it after every `generate()` call. The file is a JSON list with one entry per `Model` instance, so resumed runs are appended rather than overwritten:
+`Model` writes a record of every run to `metadata_folder/metadata_file` when the model is loaded, and updates it after every `generate()` call. Each update holds a lock on `<metadata_file>.lock`, so runs sharing the file do not lose each other's records; where file locks are not supported, this is logged and the update runs without one. The file is a JSON list with one entry per `Model` instance, so resumed runs are appended rather than overwritten:
 
 | Key | Content |
 |---|---|
@@ -284,6 +288,8 @@ Version 2.1 is compatible with 2.0: existing code and configuration files keep w
 - Input that used to produce wrong histories now raises: `addPrompt()` with a string instead of a list (`TypeError`), with an unknown role such as `"model"`, or after an empty answer (`ValueError`); `generate()` after `close()` (`RuntimeError`).
 - `generate()` also replaces empty answers (thinking models cut off during their reasoning), not only after resuming.
 - `importHistoriesFromFile()` keeps empty prompts and rows without text, so every history keeps its index.
+- Concurrent runs no longer overwrite each other: a checkpoint is only written by the run that created or imported it, it records the model and is not resumed with another one, and updates of the run metadata are locked. An answer must follow a user prompt.
+- Cut-off answers are marked, so `toJSON()` returns no fragments of cut-off JSON, and a DeepSeek-R1-style answer cut off during its reasoning is no longer taken for the answer.
 - Failures that were swallowed silently are logged (see [Errors](#errors)), and a model whose run metadata cannot be written is released before the error is raised.
 
 ### Migrating from 1.x

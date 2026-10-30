@@ -7,6 +7,7 @@ Log files written while running `Model`. `*.log` and `*.json` files are ignored 
 | `output.log` | [`logger`](https://github.com/Goldkugel/logger), throughout the run | `logger.folder`, `logger.file_name` |
 | `prompts.log` | `Model.logPrompts()` | `llm.prompt_log_folder`, `llm.prompt_log_file` |
 | `run_metadata.json` | `Model`, when the model is loaded and after every `generate()` call | `llm.metadata_folder`, `llm.metadata_file` |
+| `run_metadata.json.lock` | `Model`, as a lock while it updates the run metadata; empty, and safe to delete when no run is active | |
 
 ## `prompts.log`
 

@@ -15,11 +15,15 @@ from .ModelUtils        import (
     messageRoleElement,
     messageTextElement,
     messageReasoningElement,
+    messageTruncatedElement,
     systemColumn,
     reasoningColumnSuffix,
+    truncatedColumnSuffix,
+    modelColumn,
     writePrompt,
     writeCheckpointCSV,
-    writeJSON,
+    fileStamp,
+    updateRunRecord,
     metadataPackages,
     packageVersions,
     modelRevision,
@@ -132,6 +136,9 @@ class Model:
         self.modelIndex: int = index
         self.gpuCount: int = 0
         self.generationStats: list[dict] = []
+        # (path, fileStamp()) of the checkpoint as this instance last wrote
+        # or imported it; see _checkCheckpointOwnership()
+        self.checkpointStamp: Optional[tuple] = None
 
         # --- Step 1: Load and Validate Configuration ---
         self.config, logger_path, logger_settings = Model._resolveConfig(config)
@@ -294,9 +301,10 @@ class Model:
         :raises TypeError: If `message` is a single string instead of a list.
         :raises ValueError: If `role` is not systemRole, userRole or
             modelRole; if the number of messages neither is 1, nor matches
-            the number of histories, nor initializes empty histories; or if
-            a history the messages would be added to ends with an empty
-            answer (see generate()). Nothing is added in these cases.
+            the number of histories, nor initializes empty histories; if a
+            history the messages would be added to ends with an empty answer
+            (see generate()); or if answers (modelRole) would not follow a
+            user prompt. Nothing is added in these cases.
         """
         l = Logger()
 
@@ -331,6 +339,21 @@ class Model:
                     f"addPrompt: histories {empty} end with an empty answer; "
                     f"call generate() again (with a larger max_tokens) first."
                 )
+                l.log(error)
+                raise ValueError(error)
+
+        # An answer must follow a user prompt. The checkpoint stores turns as
+        # prompt/answer pairs, so an answer without a prompt before it (at
+        # the start of a history, after a system prompt or after another
+        # answer) would come back with an empty prompt inserted.
+        if message and role == modelRole:
+            without_prompt = [
+                idx for idx, history in enumerate(self.messageHistories)
+                if not history or history[-1].get(messageRoleElement) != userRole
+            ]
+            if not self.messageHistories or without_prompt:
+                where = f"histories {without_prompt}" if without_prompt else "a new history"
+                error = f"addPrompt: an answer must follow a user prompt, which {where} lack."
                 l.log(error)
                 raise ValueError(error)
 
@@ -527,7 +550,9 @@ class Model:
 
         :return: Number of answers generated.
         :raises RuntimeError: If there is something to generate but the
-            model was closed with close().
+            model was closed with close(), or if the checkpoint file belongs
+            to another run (see _checkCheckpointOwnership()); both are
+            checked before anything is generated.
         """
         l = Logger()
         self.skippedHistories = []
@@ -552,6 +577,10 @@ class Model:
             l.log("generate() called after close().")
             raise RuntimeError("The model was closed with close(); create a new Model to generate.")
 
+        # Fail now rather than after the first chunk if the checkpoint
+        # belongs to another run
+        self._checkCheckpointOwnership(self._checkpointPath())
+
         # Empty answers are replaced: remove them, so the prompt before them
         # is answered again
         for idx in unprocessed_indices:
@@ -559,6 +588,12 @@ class Model:
                 self.messageHistories[idx].pop()
 
         tokenizer = self.llm.get_tokenizer()
+        # Whether the chat template opens the reasoning in the prompt (e.g.
+        # DeepSeek-R1); the same for every history, as they share template
+        # and settings
+        prompt_opens_reasoning = self._promptOpensReasoning(
+            tokenizer, self.messageHistories[unprocessed_indices[0]]
+        )
         chunk_size = self.config.chunk_size
         total = len(unprocessed_indices)
         # Number of chunks, i.e. total / chunk_size rounded up
@@ -599,11 +634,16 @@ class Model:
                 # the reasoning of thinking models split off the answer
                 for idx, result in zip(batch_indices, results):
                     completion = result.outputs[0]
-                    reasoning, answer = self._splitReasoning(str(completion.text))
+                    truncated = getattr(completion, "finish_reason", None) == "length"
+                    reasoning, answer = self._splitReasoning(
+                        str(completion.text), truncated, prompt_opens_reasoning
+                    )
                     message = {
                         messageRoleElement: modelRole,
                         messageTextElement: answer
                     }
+                    if truncated:
+                        message[messageTruncatedElement] = True
                     if reasoning:
                         message[messageReasoningElement] = reasoning
                         # vLLM only reports the token count of the whole
@@ -612,7 +652,7 @@ class Model:
                         # whitespace stripped by _splitReasoning() are lost)
                         reasoning_tokens += len(tokenizer.encode(reasoning, add_special_tokens=False))
                     self.messageHistories[idx].append(message)
-                    if getattr(completion, "finish_reason", None) == "length":
+                    if truncated:
                         self.truncatedHistories.append(idx)
                     prompt_tokens += len(result.prompt_token_ids or [])
                     chunk_output_tokens += len(completion.token_ids or [])
@@ -724,7 +764,27 @@ class Model:
             return {}
         return {"chat_template_kwargs": {"enable_thinking": self.config.enable_thinking}}
 
-    def _splitReasoning(self, text: str) -> tuple[str, str]:
+    def _promptOpensReasoning(self, tokenizer, history: list[dict]) -> bool:
+        """
+        Returns whether the chat template ends the prompt of `history` with
+        config.reasoning_start_tag, as DeepSeek-R1's does. The model's output
+        then has no start tag, and a cut-off output without an end tag is
+        reasoning, not an answer (see _splitReasoning()).
+        """
+        start_tag = self.config.reasoning_start_tag
+        if not start_tag or not self.config.reasoning_end_tag:
+            return False
+        prompt = tokenizer.apply_chat_template(
+            self._chatMessages(history),
+            tokenize=False,
+            add_generation_prompt=True,
+            **self._chatTemplateArguments().get("chat_template_kwargs", {})
+        )
+        return str(prompt).rstrip().endswith(start_tag)
+
+    def _splitReasoning(
+        self, text: str, truncated: bool = False, prompt_opens_reasoning: bool = False
+    ) -> tuple[str, str]:
         """
         Splits a model output into (reasoning, answer), both stripped.
 
@@ -735,6 +795,10 @@ class Model:
           prompt (e.g. DeepSeek-R1), whose output has no start tag.
         - With a start tag but no end tag, the output was cut off during
           the reasoning: everything is reasoning and the answer is empty.
+          The same holds for a `truncated` output without an end tag if the
+          template opened the reasoning in the prompt
+          (`prompt_opens_reasoning`); otherwise a JSON draft from the middle
+          of the reasoning could be taken for the answer.
         - Otherwise (non-thinking models, thinking switched off, or
           splitting disabled with reasoning_end_tag = null) everything is
           the answer.
@@ -756,6 +820,9 @@ class Model:
         if start_tag and stripped.startswith(start_tag):
             return stripped[len(start_tag):].strip(), ""
 
+        if truncated and prompt_opens_reasoning:
+            return stripped, ""
+
         return "", stripped
 
     def _writeRunMetadata(self) -> None:
@@ -767,18 +834,13 @@ class Model:
 
         The file holds a JSON list with one entry per Model instance (keyed
         by self.runId); this instance's entry is replaced, all others are
-        kept, so resumed runs append to the same file.
+        kept, so resumed runs append to the same file. The update is locked
+        (see updateRunRecord()), so runs sharing the file at the same time
+        do not lose each other's entries.
 
         :raises ValueError: If the existing file is not a JSON list.
         """
         path = os.path.join(self.config.metadata_folder, self.config.metadata_file)
-
-        runs = []
-        if os.path.isfile(path):
-            with open(path, mode="r", encoding="utf-8") as f:
-                runs = json.load(f)
-            if not isinstance(runs, list):
-                raise ValueError(f"Run metadata file '{path}' does not contain a JSON list.")
 
         gpu_names = []
         for gpu_index in range(self.gpuCount):
@@ -818,9 +880,7 @@ class Model:
             "generations": self.generationStats,
         }
 
-        runs = [run for run in runs if run.get("run_id") != self.runId]
-        runs.append(record)
-        writeJSON(runs, path)
+        updateRunRecord(path, record)
 
     def _get_column_names(self, turn_idx: int) -> tuple[str, str]:
         """
@@ -852,19 +912,24 @@ class Model:
         history. The system prompt is stored in the "system" column; each
         user prompt and its answer are stored in a prompt/answer column pair
         named by _get_column_names(). The reasoning of a thinking model's
-        answer is stored in "<prompt column>_reasoning"; the column only
-        exists if some answer of that turn has reasoning.
+        answer is stored in "<prompt column>_reasoning", and cut-off answers
+        are marked in "<prompt column>_truncated"; these columns only exist
+        if some answer of that turn needs them. The "_model" column records
+        the model, so that importHistoriesFromFile() can refuse to resume
+        the checkpoint with another one.
+
+        The checkpoint is only overwritten if this instance wrote or
+        imported it last (see _checkCheckpointOwnership()).
 
         :return: Number of rows written.
         :raises ValueError: If there are no histories.
+        :raises RuntimeError: If the checkpoint file was written by another
+            run (see _checkCheckpointOwnership()).
         """
         l = Logger()
 
         # 1. Resolve output file path
-        target_file = os.path.join(
-            self.config.prompt_tmp_folder,
-            self.config.prompt_tmp_file
-        )
+        target_file = self._checkpointPath()
 
         # 2. Nothing to export without histories
         histories = self.getMessageHistories()
@@ -872,10 +937,13 @@ class Model:
             l.log("No messageHistories available to export.")
             raise ValueError("No message histories to export.")
 
+        # Never overwrite the checkpoint of another run
+        self._checkCheckpointOwnership(target_file)
+
         # 3. Transform histories into row dictionaries
         rows_data = []
         for history in histories:
-            row_dict = {}
+            row_dict = {modelColumn: self.model or ""}
             prompt_counter = 0
 
             for turn in history:
@@ -890,6 +958,8 @@ class Model:
                     reasoning = turn.get(messageReasoningElement)
                     if reasoning:
                         row_dict[prompt_col + reasoningColumnSuffix] = str(reasoning)
+                    if turn.get(messageTruncatedElement):
+                        row_dict[prompt_col + truncatedColumnSuffix] = "true"
                     prompt_counter += 1
                 elif role == systemRole:
                     # System prompts get a dedicated column so the import
@@ -915,8 +985,45 @@ class Model:
         df = pd.DataFrame(rows_data)
 
         # 5. Write atomically, so an interrupted write never corrupts the
-        # previous checkpoint
-        return writeCheckpointCSV(df, target_file)
+        # previous checkpoint, and remember the written version
+        written = writeCheckpointCSV(df, target_file)
+        self.checkpointStamp = (target_file, fileStamp(target_file))
+        return written
+
+    def _checkpointPath(self) -> str:
+        """Returns the path of the checkpoint file."""
+        return os.path.join(self.config.prompt_tmp_folder, self.config.prompt_tmp_file)
+
+    def _checkCheckpointOwnership(self, path: str) -> None:
+        """
+        Makes sure that writing the checkpoint at `path` cannot destroy the
+        work of another run. Passes if there is no file yet, or if the file
+        is unchanged since this instance last wrote or imported it.
+
+        Two runs sharing a checkpoint (the same prompt_tmp_folder and
+        prompt_tmp_file, e.g. two models or the jobs of a Slurm job array
+        started with one config) would otherwise overwrite each other's
+        checkpoint after every chunk, and a resumed run would continue with
+        the other run's histories.
+
+        :raises RuntimeError: If the file exists but was not written or
+            imported by this instance, or was changed since.
+        """
+        current = fileStamp(path)
+        if current is None or self.checkpointStamp == (path, current):
+            return
+
+        if self.checkpointStamp is not None and self.checkpointStamp[0] == path:
+            problem = "was changed by another run since this run last wrote or imported it"
+        else:
+            problem = "already exists and was not imported by this run"
+        error = (
+            f"Checkpoint '{path}' {problem}. Give every concurrent run its own "
+            f"prompt_tmp_file; to resume this checkpoint, call "
+            f"importHistoriesFromFile() first; to start over, delete it."
+        )
+        Logger().log(error)
+        raise RuntimeError(error)
 
     def importHistoriesFromFile(self) -> int:
         """
@@ -940,16 +1047,13 @@ class Model:
         :return: Total number of message histories populated.
         :raises FileNotFoundError: If the checkpoint file does not exist,
             e.g. because no earlier run was interrupted.
-        :raises ValueError: If the checkpoint is empty or has no
-            prompt/answer columns.
+        :raises ValueError: If the checkpoint is empty, has no prompt/answer
+            columns, or was written with another model.
         """
         l = Logger()
 
         # 1. Load the checkpoint file
-        target_file = os.path.join(
-            self.config.prompt_tmp_folder,
-            self.config.prompt_tmp_file
-        )
+        target_file = self._checkpointPath()
 
         if not os.path.exists(target_file):
             l.log(f"File not found at '{target_file}'. Cannot populate messageHistories.")
@@ -972,6 +1076,19 @@ class Model:
         if df is None or df.empty:
             l.log("DataFrame is empty or None. Cannot populate histories.")
             raise ValueError(f"Checkpoint file '{target_file}' contains no histories.")
+
+        # Resuming with another model would mix the answers of two models.
+        # Checkpoints written before the "_model" column existed are
+        # accepted.
+        if modelColumn in df.columns:
+            checkpoint_models = set(df[modelColumn]) - {""}
+            if checkpoint_models and checkpoint_models != {self.model}:
+                error = (
+                    f"Checkpoint '{target_file}' was written with model "
+                    f"{sorted(checkpoint_models)}, not '{self.model}'."
+                )
+                l.log(error)
+                raise ValueError(error)
 
         # 2. Identify all prompt/answer column pairs present in the DataFrame,
         # turn by turn until the first turn with neither column
@@ -1041,14 +1158,18 @@ class Model:
                     reasoning = row.get(prompt_col + reasoningColumnSuffix)
                     if Model._hasText(reasoning):
                         message[messageReasoningElement] = str(reasoning)
+                    if row.get(prompt_col + truncatedColumnSuffix) == "true":
+                        message[messageTruncatedElement] = True
                     history.append(message)
 
             # Rows without any text are kept as empty histories, so the
             # indices of all later histories stay the same
             new_message_histories.append(history)
 
-        # 4. Assign reconstructed histories back to model state
+        # 4. Assign reconstructed histories back to model state. From now
+        # on this instance owns the checkpoint and may overwrite it.
         self.messageHistories = new_message_histories
+        self.checkpointStamp = (target_file, fileStamp(target_file))
         l.log(f"Successfully imported {len(self.messageHistories)} message histories.")
 
         return len(self.messageHistories)
@@ -1065,6 +1186,9 @@ class Model:
         Markdown code block, the first complete JSON object or array
         anywhere in the answer, and the whole answer as a bare JSON scalar.
         Only the answer is searched, never the reasoning of a thinking model.
+        For an answer cut off at max_tokens, the JSON value must start at its
+        first bracket: a cut-off array such as '[{"a": 1}, {"b":' must not
+        yield its first element as if it were the result.
 
         :param index: Index of the target message history.
         :return: Parsed JSON value, or None if the history has no answer
@@ -1108,11 +1232,15 @@ class Model:
         # of the JSON value, so trailing prose (even prose containing
         # brackets) does not break parsing.
         decoder = json.JSONDecoder()
+        truncated = bool(history[-1].get(messageTruncatedElement))
         for bracket in re.finditer(r"[\{\[]", text):
             try:
                 parsed, _ = decoder.raw_decode(text, bracket.start())
                 return parsed
             except json.JSONDecodeError:
+                if truncated:
+                    l.log(f"The answer at index {index} was cut off inside its JSON value.")
+                    return None
                 continue
 
         # Strategy 3: Parse the whole text, which only succeeds for a bare

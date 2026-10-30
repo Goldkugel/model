@@ -4,7 +4,7 @@ The source code of the `model` package (installed from this folder, see `pyproje
 
 | File | Content |
 |---|---|
-| `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `messageReasoningElement`, `gpu`, `cpu` |
+| `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `messageReasoningElement`, `messageTruncatedElement`, `gpu`, `cpu` |
 | `Model.py` | `Model` class: loads a model into vLLM (configured from a YAML file, a dict or a `ModelConfig`), manages the conversation histories, fills prompt templates, generates answers in chunks (skipping prompts longer than the context, splitting off the reasoning of thinking models, logging progress), writes and reads checkpoints, writes the run metadata, parses JSON answers and frees GPU memory |
 | `ModelConfig.py` | `ModelConfig`, the pydantic schema of the `llm` config section |
 | `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log, atomic writers for checkpoints (`writeCheckpointCSV()`) and JSON (`writeJSON()`), and helpers for the run metadata (package versions, model revision, file hashes) |
@@ -34,7 +34,7 @@ A history is a list of messages in the chat-template format, e.g.:
 ]
 ```
 
-An answer of a thinking model also has a `"reasoning"` key (`messageReasoningElement`) holding its reasoning; only `role` and `content` are sent to the model.
+An answer of a thinking model also has a `"reasoning"` key (`messageReasoningElement`) holding its reasoning, and an answer cut off at `max_tokens` has `"truncated": True` (`messageTruncatedElement`); only `role` and `content` are sent to the model. An `assistant` message always follows a `user` message.
 
 `Model.messageHistories` holds one such list per independent conversation. `generate()` answers every history whose last message is not from the `assistant`, except those whose prompt does not fit into `max_model_len` (listed in `Model.skippedHistories`).
 

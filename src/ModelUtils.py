@@ -7,10 +7,17 @@ from importlib  import metadata
 from typing     import Optional
 from logger     import Logger
 import pandas   as pd
+import contextlib
 import hashlib
 import json
 import os
 import csv
+
+# File locks (see lockedFile()) are only available on POSIX systems
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 # ==============================================================================
 # Role Definitions
@@ -43,6 +50,10 @@ messageTextElement = "content"
 # answer text. It is not sent back to the model: Model passes only the role
 # and content keys to vLLM and the chat template.
 messageReasoningElement = "reasoning"
+# Set to True on an answer that was cut off at max_tokens. toJSON() then only
+# accepts JSON that starts at the answer's first bracket, so it does not
+# return a fragment of a cut-off object or array.
+messageTruncatedElement = "truncated"
 
 # ==============================================================================
 # Checkpoint Column Constants
@@ -55,6 +66,13 @@ systemColumn = "system"
 # "mapping_reasoning" next to "mapping" and "mapping_answer". Only written
 # for histories with reasoning.
 reasoningColumnSuffix = "_reasoning"
+# Suffix of the column marking cut-off answers with "true", e.g.
+# "mapping_truncated". Only written if some answer of that turn was cut off.
+truncatedColumnSuffix = "_truncated"
+# Column holding the model that wrote the checkpoint, so that a checkpoint
+# is never resumed with another model. The leading underscore keeps it apart
+# from the prompt columns, which are named after prompt files.
+modelColumn = "_model"
 
 
 # ==============================================================================
@@ -166,6 +184,77 @@ def writeCheckpointCSV(data: pd.DataFrame, path: str) -> int:
     l.log(f"Writing checkpoint '{file_name}' completed.")
 
     return len(data)
+
+
+def fileStamp(path: str) -> Optional[tuple[int, int, int]]:
+    """
+    Returns (inode, size, modification time) of the file at `path`, or None
+    if it does not exist. Every write of another process changes the stamp:
+    _writeAtomically() replaces the file, which gives it a new inode.
+    """
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+@contextlib.contextmanager
+def lockedFile(path: str):
+    """
+    Holds an exclusive lock on "<path>.lock" while the block runs, so that
+    processes updating the same file (e.g. the jobs of a Slurm job array)
+    take turns. Where file locks are not supported (Windows, or a cluster
+    file system mounted without lock support), this is logged and the block
+    runs without a lock.
+
+    :param path: Path of the file the lock protects.
+    """
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+    lock_path = path + ".lock"
+    with open(lock_path, mode="a", encoding="utf-8") as handle:
+        locked = False
+        if fcntl is None:
+            Logger().log(f"File locks are not supported here; updating '{path}' without a lock.")
+        else:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                locked = True
+            except OSError as e:
+                Logger().log(f"Could not lock '{lock_path}' ({e!r}); updating '{path}' without a lock.")
+        try:
+            yield
+        finally:
+            if locked:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def updateRunRecord(path: str, record: dict, key: str = "run_id") -> None:
+    """
+    Replaces the record with the same `key` in the JSON list at `path`, or
+    appends it, keeping all other records. The read and the write happen
+    under one lock (see lockedFile()), so records of runs updating the file
+    at the same time are not lost.
+
+    :param path: Path of the JSON file; created if it does not exist.
+    :param record: Record to store; must contain `key`.
+    :param key: Key identifying a record.
+    :raises ValueError: If the existing file is not a JSON list.
+    """
+    with lockedFile(path):
+        records = []
+        if os.path.isfile(path):
+            with open(path, mode="r", encoding="utf-8") as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                raise ValueError(f"Run metadata file '{path}' does not contain a JSON list.")
+
+        records = [entry for entry in records if entry.get(key) != record[key]]
+        records.append(record)
+        writeJSON(records, path)
 
 
 def writeJSON(data, path: str) -> None:

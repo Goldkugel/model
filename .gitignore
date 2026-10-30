@@ -217,8 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Run metadata (see data/logs/README.md)
+# Run metadata and its lock file (see data/logs/README.md)
 data/logs/*.json
+*.lock
 
 # Generation checkpoints (see data/tmp/README.md)
 *.tmp

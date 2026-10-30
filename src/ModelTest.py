@@ -5,6 +5,7 @@ sys.dont_write_bytecode = True
 
 import importlib
 import json
+import multiprocessing
 import os
 import pathlib
 import tempfile
@@ -22,7 +23,9 @@ from model            import (
 import model as model_package
 from model.ModelUtils import (
     systemRole, userRole, modelRole, writePrompt, writeJSON, modelRevision, packageVersions,
+    updateRunRecord, writeCheckpointCSV, messageTruncatedElement,
 )
+import model.ModelUtils as model_utils
 
 # The Model module itself (not the class re-exported as `model.Model`), for
 # monkeypatching names it imported from vllm.
@@ -81,6 +84,7 @@ def bare_model(model_config_data, tmp_path) -> Model:
     model.modelIndex = 0
     model.gpuCount = 0
     model.generationStats = []
+    model.checkpointStamp = None
     return model
 
 
@@ -95,15 +99,21 @@ def logged(monkeypatch) -> list[str]:
 class FakeTokenizer:
     """
     Chat-template stand-in: one token per character of every message.
-    Records the messages and extra template arguments of every call.
+    Records the messages and extra template arguments of every call. With
+    tokenize=False it returns the prompt as text, ending with
+    `generation_prompt` (e.g. "<think>\n" for a DeepSeek-R1-style template).
     """
+
+    generation_prompt = ""
 
     def __init__(self):
         self.calls = []
 
     def apply_chat_template(self, history, tokenize, add_generation_prompt, **kwargs):
-        assert tokenize and add_generation_prompt
+        assert add_generation_prompt
         self.calls.append((history, kwargs))
+        if not tokenize:
+            return "".join(message[messageTextElement] for message in history) + self.generation_prompt
         return [0] * sum(len(message[messageTextElement]) for message in history)
 
     def encode(self, text, add_special_tokens=True):
@@ -543,6 +553,21 @@ class TestAddPromptValidation:
         assert [len(history) for history in bare_model.messageHistories] == [2, 2]
 
 
+    @pytest.mark.parametrize("before", [
+        [],                                   # a new history
+        [(systemRole, "Be concise.")],        # after a system prompt
+        [(userRole, "q"), (modelRole, "a")],  # after another answer
+    ])
+    def test_an_answer_without_a_prompt_before_it_raises(self, bare_model, before):
+        # The checkpoint used to bring it back with an empty prompt inserted
+        for role, text in before:
+            bare_model.addPrompt(role, [text])
+
+        with pytest.raises(ValueError, match="must follow a user prompt"):
+            bare_model.addPrompt(modelRole, ["answer"])
+        assert sum(len(history) for history in bare_model.messageHistories) == len(before)
+
+
 # --- Model.addPromptFromFile ----------------------------------------------------
 
 class TestAddPromptFromFile:
@@ -760,7 +785,7 @@ class TestExportImportHistoriesRoundTrip:
 
         bare_model.exportHistoriesToFile()
         header = (tmp_path / "raw.tmp").read_text(encoding="utf-8").splitlines()[0]
-        assert header == '"prompt_a";"prompt_a_answer";"prompt_b";"prompt_b_answer"'
+        assert header == '"_model";"prompt_a";"prompt_a_answer";"prompt_b";"prompt_b_answer"'
 
         bare_model.messageHistories = []
         bare_model.importHistoriesFromFile()
@@ -1037,6 +1062,152 @@ class TestGenerateResumeAndTurns:
 
         assert bare_model.generate() == 1
         assert bare_model.skippedHistories == [1]
+
+
+class ScriptedLLM(FakeLLM):
+    """FakeLLM answering every prompt with the same (text, finish_reason)."""
+
+    def __init__(self, text: str, finish_reason: str = "stop"):
+        super().__init__()
+        self.text = text
+        self.finish_reason = finish_reason
+
+    def answer(self, history) -> tuple[str, str]:
+        return self.text, self.finish_reason
+
+
+def _record_updates(path: str, worker: int, count: int) -> None:
+    """Adds `count` run records for `worker` to the run metadata at `path`."""
+    for i in range(count):
+        updateRunRecord(path, {"run_id": f"{worker}-{i}"})
+
+
+class TestConcurrentRuns:
+    """
+    Runs sharing a checkpoint or run metadata file (two models, or the jobs
+    of a Slurm job array started with one config) must not destroy each
+    other's work.
+    """
+
+    def test_generate_refuses_a_checkpoint_it_did_not_import(self, bare_model):
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.exportHistoriesToFile()
+        other_run = Model.__new__(Model)
+        other_run.__dict__.update(bare_model.__dict__, checkpointStamp=None, messageHistories=[])
+        other_run.addPrompt(userRole, ["other q"])
+        other_run.llm = FakeLLM()
+
+        with pytest.raises(RuntimeError, match="was not imported by this run"):
+            other_run.generate()
+        # Refused before anything was generated
+        assert other_run.llm.batches == []
+
+    def test_export_detects_a_checkpoint_changed_by_another_run(self, bare_model):
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.exportHistoriesToFile()
+        path = os.path.join(bare_model.config.prompt_tmp_folder, bare_model.config.prompt_tmp_file)
+        writeCheckpointCSV(model_module.pd.DataFrame([{"_model": "other", "prompt_a": "x"}]), path)
+
+        with pytest.raises(RuntimeError, match="was changed by another run"):
+            bare_model.exportHistoriesToFile()
+
+    def test_resumed_run_may_overwrite_the_checkpoint(self, bare_model):
+        bare_model.addPrompt(userRole, ["a", "b"])
+        bare_model.exportHistoriesToFile()
+        resumed = Model.__new__(Model)
+        resumed.__dict__.update(bare_model.__dict__, checkpointStamp=None, messageHistories=[])
+        resumed.llm = FakeLLM()
+
+        resumed.importHistoriesFromFile()
+
+        assert resumed.generate() == 2
+
+    def test_a_checkpoint_of_another_model_is_not_resumed(self, bare_model):
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.exportHistoriesToFile()
+        bare_model.model = "dummy/model-b"
+
+        with pytest.raises(ValueError, match="written with model \\['dummy/model-a'\\]"):
+            bare_model.importHistoriesFromFile()
+
+    def test_a_checkpoint_without_model_column_is_accepted(self, bare_model):
+        # Written by a version before the "_model" column
+        path = os.path.join(bare_model.config.prompt_tmp_folder, bare_model.config.prompt_tmp_file)
+        writeCheckpointCSV(model_module.pd.DataFrame([{"prompt_a": "q", "prompt_a_answer": "a"}]), path)
+
+        assert bare_model.importHistoriesFromFile() == 1
+
+    @pytest.mark.skipif(
+        model_utils.fcntl is None or "fork" not in multiprocessing.get_all_start_methods(),
+        reason="needs file locks and fork",
+    )
+    def test_concurrent_metadata_updates_keep_every_record(self, tmp_path):
+        path = str(tmp_path / "run_metadata.json")
+        context = multiprocessing.get_context("fork")
+        workers = [context.Process(target=_record_updates, args=(path, worker, 25)) for worker in range(4)]
+        for process in workers:
+            process.start()
+        for process in workers:
+            process.join()
+
+        runs = json.loads(open(path, encoding="utf-8").read())
+        assert len(runs) == 100
+        assert all(process.exitcode == 0 for process in workers)
+
+
+class TestCutOffAnswers:
+
+    def test_cut_off_reasoning_opened_by_the_template_is_no_answer(self, bare_model):
+        # DeepSeek-R1-style: the template ends the prompt with <think>, so the
+        # cut-off output has no tags and is all reasoning
+        bare_model.llm = ScriptedLLM('The user wants {"draft": true} ... still thinking', "length")
+        bare_model.llm.tokenizer.generation_prompt = "<think>\n"
+        bare_model.addPrompt(userRole, ["q"])
+
+        bare_model.generate()
+
+        answer = bare_model.messageHistories[0][-1]
+        assert answer[messageTextElement] == ""
+        assert answer[messageReasoningElement].startswith("The user wants")
+        assert bare_model.toJSON(0) is None
+
+    def test_finished_output_without_tags_stays_the_answer(self, bare_model):
+        bare_model.llm = ScriptedLLM('{"label": "kidney"}')
+        bare_model.llm.tokenizer.generation_prompt = "<think>\n"
+        bare_model.addPrompt(userRole, ["q"])
+
+        bare_model.generate()
+
+        assert bare_model.toJSON(0) == {"label": "kidney"}
+
+    def test_cut_off_json_does_not_yield_a_fragment(self, bare_model):
+        bare_model.llm = ScriptedLLM('[{"label": "kidney"}, {"label": "li', "length")
+        bare_model.addPrompt(userRole, ["q"])
+
+        bare_model.generate()
+
+        assert bare_model.messageHistories[0][-1][messageTruncatedElement] is True
+        assert bare_model.toJSON(0) is None
+
+    def test_complete_json_before_the_cut_is_parsed(self, bare_model):
+        bare_model.llm = ScriptedLLM('{"label": "kidney"} because the kidney is aff', "length")
+        bare_model.addPrompt(userRole, ["q"])
+
+        bare_model.generate()
+
+        assert bare_model.toJSON(0) == {"label": "kidney"}
+
+    def test_truncation_mark_survives_the_checkpoint(self, bare_model):
+        bare_model.llm = ScriptedLLM('[{"label": "kidney"}, {"label": "li', "length")
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.reset()
+        bare_model.importHistoriesFromFile()
+
+        assert bare_model.messageHistories == expected
+        assert bare_model.toJSON(0) is None
 
 
 # --- Thinking models ------------------------------------------------------------
@@ -1418,7 +1589,7 @@ class TestPackageExports:
     def test_every_exported_name_is_importable(self):
         assert set(model_package.__all__) == {
             "Model", "ModelConfig", "messageRoleElement", "messageTextElement",
-            "messageReasoningElement", "gpu", "cpu",
+            "messageReasoningElement", "messageTruncatedElement", "gpu", "cpu",
         }
         for name in model_package.__all__:
             assert getattr(model_package, name) is not None
