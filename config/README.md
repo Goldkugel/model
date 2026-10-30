@@ -28,6 +28,9 @@ llm:
   dtype: "auto"
   quantization: null
   enable_prefix_caching: true
+  enable_thinking: null
+  reasoning_start_tag: "<think>"
+  reasoning_end_tag: "</think>"
   max_tokens: 2048
   chunk_size: 500
   prompt_tmp_folder: "./data/tmp/"

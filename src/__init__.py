@@ -5,13 +5,14 @@ sys.dont_write_bytecode = True
 
 from .Model         import Model
 from .ModelConfig   import ModelConfig
-from .ModelUtils    import messageRoleElement, messageTextElement, gpu, cpu
+from .ModelUtils    import messageRoleElement, messageTextElement, messageReasoningElement, gpu, cpu
 
 __all__ = [
     "Model", 
     "ModelConfig",
     "messageRoleElement",
     "messageTextElement",
+    "messageReasoningElement",
     "gpu",
     "cpu"
 ]

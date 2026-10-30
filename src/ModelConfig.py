@@ -96,7 +96,43 @@ class ModelConfig(BaseModel):
         description="Reuse the KV cache of common prompt prefixes."
     )
 
-    # Maximum number of new tokens generated per output sequence.
+    # Thinking (reasoning) models such as Qwen3 or DeepSeek-R1 write their
+    # reasoning before the answer, between reasoning_start_tag and
+    # reasoning_end_tag. Model.generate() stores it separately from the
+    # answer (see Model._splitReasoning()). Reasoning takes up output
+    # tokens, so these models need a much larger max_tokens (e.g. 8192 to
+    # 32768) and a matching max_model_len; most model cards also recommend
+    # a temperature of about 0.6 instead of near-greedy decoding, which
+    # tends to make the reasoning repeat itself.
+
+    # Switches thinking on (True) or off (False) for hybrid models such as
+    # Qwen3, by passing enable_thinking to the chat template. null leaves
+    # the chat template's default (on for Qwen3); models whose template has
+    # no such switch ignore it.
+    enable_thinking: Optional[bool] = Field(
+        default=None,
+        description="enable_thinking passed to the chat template, or null for the template's default."
+    )
+
+    # Marker that opens the reasoning. Some chat templates (e.g.
+    # DeepSeek-R1) put it into the prompt, so the output only contains the
+    # closing marker; both cases are handled.
+    reasoning_start_tag: str = Field(
+        default="<think>",
+        description="Marker that opens the reasoning of a thinking model."
+    )
+
+    # Marker that closes the reasoning; the answer is the text after its
+    # first occurrence. null disables the splitting, so the whole output is
+    # stored as the answer.
+    reasoning_end_tag: Optional[str] = Field(
+        default="</think>",
+        min_length=1,
+        description="Marker that closes the reasoning of a thinking model, or null to disable splitting."
+    )
+
+    # Maximum number of new tokens generated per output sequence. For
+    # thinking models this includes the reasoning.
     max_tokens: int = Field(
         default=2048,
         gt=0,

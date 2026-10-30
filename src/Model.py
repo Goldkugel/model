@@ -12,7 +12,9 @@ from .ModelUtils        import (
     modelRole,
     messageRoleElement,
     messageTextElement,
+    messageReasoningElement,
     systemColumn,
+    reasoningColumnSuffix,
     writePrompt,
     writeCheckpointCSV,
     writeJSON,
@@ -120,6 +122,9 @@ class Model:
         # Indices of the histories the last generate() call skipped because
         # their prompt does not fit into config.max_model_len
         self.skippedHistories: list[int] = []
+        # Indices of the histories whose answer the last generate() call cut
+        # off at config.max_tokens (finish_reason "length")
+        self.truncatedHistories: list[int] = []
         # Run metadata (see _writeRunMetadata()): one statistics record per
         # generate() call, under an id unique to this instance
         self.runId: str = uuid.uuid4().hex
@@ -446,6 +451,13 @@ class Model:
         (see exportHistoriesToFile()), so an interrupted run can be resumed
         with importHistoriesFromFile().
 
+        For thinking models, the reasoning is split off the answer (see
+        _splitReasoning()): the answer becomes the message text, the
+        reasoning is stored under messageReasoningElement on the same
+        message and is never sent back to the model. Answers cut off at
+        config.max_tokens are listed in self.truncatedHistories; a thinking
+        model cut off during its reasoning gets an empty answer.
+
         A history whose prompt does not fit into config.max_model_len is
         skipped instead of failing its whole chunk: it keeps no answer, its
         index is stored in self.skippedHistories, and toJSON() returns None
@@ -458,6 +470,7 @@ class Model:
         """
         l = Logger()
         self.skippedHistories = []
+        self.truncatedHistories = []
 
         # 1. Identify indices where the model has not yet generated a response
         # (Histories whose last message role is NOT modelRole)
@@ -483,6 +496,7 @@ class Model:
         generated = 0
         prompt_tokens = 0
         output_tokens = 0
+        reasoning_tokens = 0
 
         # 2. Process inference in chunked batches
         for chunk_number, i in enumerate(range(0, total, chunk_size), start=1):
@@ -499,18 +513,27 @@ class Model:
 
                 # Run batched generation over the chat histories
                 results = self.llm.chat(
-                    [self.messageHistories[idx] for idx in batch_indices],
+                    [self._chatMessages(self.messageHistories[idx]) for idx in batch_indices],
                     self.sampling_params,
-                    use_tqdm=False
+                    use_tqdm=False,
+                    **self._chatTemplateArguments()
                 )
 
-                # 3. Append outputs back to their respective histories
+                # 3. Append outputs back to their respective histories, with
+                # the reasoning of thinking models split off the answer
                 for idx, result in zip(batch_indices, results):
                     completion = result.outputs[0]
-                    self.messageHistories[idx].append({
+                    reasoning, answer = self._splitReasoning(str(completion.text))
+                    message = {
                         messageRoleElement: modelRole,
-                        messageTextElement: str(completion.text).strip()
-                    })
+                        messageTextElement: answer
+                    }
+                    if reasoning:
+                        message[messageReasoningElement] = reasoning
+                        reasoning_tokens += len(tokenizer.encode(reasoning, add_special_tokens=False))
+                    self.messageHistories[idx].append(message)
+                    if getattr(completion, "finish_reason", None) == "length":
+                        self.truncatedHistories.append(idx)
                     prompt_tokens += len(result.prompt_token_ids or [])
                     chunk_output_tokens += len(completion.token_ids or [])
 
@@ -537,6 +560,11 @@ class Model:
         elapsed = time.perf_counter() - run_start
         if self.skippedHistories:
             l.log(f"Skipped {len(self.skippedHistories)} histories whose prompt exceeds max_model_len: {self.skippedHistories}")
+        if self.truncatedHistories:
+            l.log(f"{len(self.truncatedHistories)} answers were cut off at max_tokens "
+                  f"({self.config.max_tokens}): {self.truncatedHistories}")
+        if reasoning_tokens:
+            l.log(f"Of the generated tokens, about {reasoning_tokens} were reasoning.")
         l.log(
             f"Generation completed: {generated} answers, {prompt_tokens} prompt "
             f"and {output_tokens} generated tokens in {_duration(elapsed)} "
@@ -551,8 +579,11 @@ class Model:
             "histories": total,
             "answers": generated,
             "skipped": list(self.skippedHistories),
+            "truncated": list(self.truncatedHistories),
             "prompt_tokens": prompt_tokens,
             "generated_tokens": output_tokens,
+            # Re-tokenized from the split-off reasoning, so approximate
+            "reasoning_tokens": reasoning_tokens,
         })
         self._writeRunMetadata()
 
@@ -565,10 +596,13 @@ class Model:
         within config.max_model_len. Otherwise the index is added to
         self.skippedHistories.
         """
+        # Format the prompt exactly as generate() sends it: without stored
+        # reasoning and with the same chat template arguments
         token_ids = tokenizer.apply_chat_template(
-            self.messageHistories[index],
+            self._chatMessages(self.messageHistories[index]),
             tokenize=True,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            **self._chatTemplateArguments().get("chat_template_kwargs", {})
         )
         # Some transformers versions return a BatchEncoding instead of a list
         if hasattr(token_ids, "keys"):
@@ -583,6 +617,64 @@ class Model:
         )
         self.skippedHistories.append(index)
         return False
+
+    @staticmethod
+    def _chatMessages(history: list[dict]) -> list[dict]:
+        """
+        Returns the messages of `history` as they are sent to the model:
+        only role and content, so stored reasoning is never fed back.
+        """
+        return [
+            {
+                messageRoleElement: message[messageRoleElement],
+                messageTextElement: message[messageTextElement],
+            }
+            for message in history
+        ]
+
+    def _chatTemplateArguments(self) -> dict:
+        """
+        Extra keyword arguments for LLM.chat(): chat_template_kwargs with
+        enable_thinking if config.enable_thinking is set, otherwise none, so
+        the chat template's default applies.
+        """
+        if self.config.enable_thinking is None:
+            return {}
+        return {"chat_template_kwargs": {"enable_thinking": self.config.enable_thinking}}
+
+    def _splitReasoning(self, text: str) -> tuple[str, str]:
+        """
+        Splits a model output into (reasoning, answer), both stripped.
+
+        - With config.reasoning_end_tag in the text, the reasoning is the
+          text before its first occurrence (without a leading
+          config.reasoning_start_tag) and the answer the text after it.
+          This also covers chat templates that put the start tag into the
+          prompt (e.g. DeepSeek-R1), whose output has no start tag.
+        - With a start tag but no end tag, the output was cut off during
+          the reasoning: everything is reasoning and the answer is empty.
+        - Otherwise (non-thinking models, thinking switched off, or
+          splitting disabled with reasoning_end_tag = null) everything is
+          the answer.
+        """
+        end_tag   = self.config.reasoning_end_tag
+        start_tag = self.config.reasoning_start_tag
+        stripped  = text.strip()
+
+        if not end_tag:
+            return "", stripped
+
+        if end_tag in stripped:
+            reasoning, _, answer = stripped.partition(end_tag)
+            reasoning = reasoning.strip()
+            if start_tag and reasoning.startswith(start_tag):
+                reasoning = reasoning[len(start_tag):]
+            return reasoning.strip(), answer.strip()
+
+        if start_tag and stripped.startswith(start_tag):
+            return stripped[len(start_tag):].strip(), ""
+
+        return "", stripped
 
     def _writeRunMetadata(self) -> None:
         """
@@ -673,7 +765,9 @@ class Model:
         (config.prompt_tmp_folder / config.prompt_tmp_file), one row per
         history. The system prompt is stored in the "system" column; each
         user prompt and its answer are stored in a prompt/answer column pair
-        named by _get_column_names().
+        named by _get_column_names(). The reasoning of a thinking model's
+        answer is stored in "<prompt column>_reasoning"; the column only
+        exists if some answer of that turn has reasoning.
 
         :return: Number of rows written.
         :raises ValueError: If there are no histories.
@@ -704,8 +798,12 @@ class Model:
                 
                 if role == modelRole:
                     # Model response pairs with the current active prompt index
-                    _, ans_col = self._get_column_names(prompt_counter)
+                    prompt_col, ans_col = self._get_column_names(prompt_counter)
                     row_dict[ans_col] = str(text).strip() if text else ""
+                    # The reasoning of a thinking model gets its own column
+                    reasoning = turn.get(messageReasoningElement)
+                    if reasoning:
+                        row_dict[prompt_col + reasoningColumnSuffix] = str(reasoning)
                     prompt_counter += 1
                 elif role == systemRole:
                     # System prompts get a dedicated column so the import
@@ -740,8 +838,10 @@ class Model:
 
         Reconstructs multi-turn conversation histories by mapping the
         "system" column and the prompt/answer column pairs back into
-        role-message dictionaries. Empty cells are skipped, so a history
-        whose last answer is missing is generated again by generate().
+        role-message dictionaries, and restores the reasoning of answers
+        from the reasoning columns. Empty cells are skipped, so a history
+        whose last answer is missing (e.g. an answer cut off during the
+        reasoning) is generated again by generate().
 
         :return: Total number of message histories populated.
         :raises FileNotFoundError: If the checkpoint file does not exist,
@@ -823,13 +923,17 @@ class Model:
                         messageTextElement: str(prompt_val)
                     })
 
-                # Extract answer text (Model)
+                # Extract answer text (Model), with its reasoning if any
                 ans_val = row.get(ans_col)
                 if pd.notna(ans_val) and str(ans_val).strip() != "":
-                    history.append({
+                    message = {
                         messageRoleElement: modelRole,
                         messageTextElement: str(ans_val).strip()
-                    })
+                    }
+                    reasoning = row.get(prompt_col + reasoningColumnSuffix)
+                    if pd.notna(reasoning) and str(reasoning).strip() != "":
+                        message[messageReasoningElement] = str(reasoning)
+                    history.append(message)
 
             if history:
                 new_message_histories.append(history)
@@ -914,6 +1018,8 @@ class Model:
         Clears all active conversation histories and resets state.
         """
         self.messageHistories = []
+        self.skippedHistories = []
+        self.truncatedHistories = []
 
     def logPrompts(self) -> None:
         """

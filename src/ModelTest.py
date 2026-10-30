@@ -13,7 +13,9 @@ import torch
 import yaml
 from pydantic import ValidationError
 
-from model            import Model, ModelConfig, messageRoleElement, messageTextElement
+from model            import (
+    Model, ModelConfig, messageRoleElement, messageTextElement, messageReasoningElement,
+)
 from model.ModelUtils import systemRole, userRole, modelRole, writePrompt
 
 # The Model module itself (not the class re-exported as `model.Model`), for
@@ -66,6 +68,7 @@ def bare_model(model_config_data, tmp_path) -> Model:
     model.sampling_params = None
     model.model = model_config_data["model_id"][0]
     model.skippedHistories = []
+    model.truncatedHistories = []
     model.runId = "test-run"
     model.runStarted = "2026-01-01T00:00:00+00:00"
     model.modelIndex = 0
@@ -75,11 +78,21 @@ def bare_model(model_config_data, tmp_path) -> Model:
 
 
 class FakeTokenizer:
-    """Chat-template stand-in: one token per character of every message."""
+    """
+    Chat-template stand-in: one token per character of every message.
+    Records the messages and extra template arguments of every call.
+    """
 
-    def apply_chat_template(self, history, tokenize, add_generation_prompt):
+    def __init__(self):
+        self.calls = []
+
+    def apply_chat_template(self, history, tokenize, add_generation_prompt, **kwargs):
         assert tokenize and add_generation_prompt
+        self.calls.append((history, kwargs))
         return [0] * sum(len(message[messageTextElement]) for message in history)
+
+    def encode(self, text, add_special_tokens=True):
+        return [0] * len(text)
 
 
 class FakeLLM:
@@ -90,20 +103,45 @@ class FakeLLM:
 
     def __init__(self):
         self.batches = []
+        self.tokenizer = FakeTokenizer()
+        # Messages and extra keyword arguments of every chat() call
+        self.chat_calls = []
 
     def get_tokenizer(self):
-        return FakeTokenizer()
+        return self.tokenizer
 
-    def chat(self, histories, sampling_params, use_tqdm):
+    def answer(self, history) -> tuple[str, str]:
+        """(text, finish_reason) of the answer to one history."""
+        return f"  answer to {history[-1][messageTextElement]}\n", "stop"
+
+    def chat(self, histories, sampling_params, use_tqdm, **kwargs):
         self.batches.append(len(histories))
+        self.chat_calls.append((histories, kwargs))
         results = []
         for history in histories:
-            text = f"answer to {history[-1][messageTextElement]}"
+            text, finish_reason = self.answer(history)
             results.append(types.SimpleNamespace(
                 prompt_token_ids=[0] * 10,
-                outputs=[types.SimpleNamespace(text=f"  {text}\n", token_ids=[0] * 3)],
+                outputs=[types.SimpleNamespace(
+                    text=text, token_ids=[0] * 3, finish_reason=finish_reason
+                )],
             ))
         return results
+
+
+class FakeThinkingLLM(FakeLLM):
+    """
+    FakeLLM answering like a thinking model: reasoning in <think> tags
+    (with a JSON draft in it) before a JSON answer. A prompt starting with
+    "long" is cut off during the reasoning.
+    """
+
+    def answer(self, history) -> tuple[str, str]:
+        prompt = history[-1][messageTextElement]
+        if prompt.startswith("long"):
+            return '<think>\nStill reasoning about {"draft": true}', "length"
+        return (f'<think>\nThe user asks {prompt}. Draft: {{"draft": true}}\n</think>\n\n'
+                f'{{"answer": "{prompt}"}}', "stop")
 
 
 def _write_yaml_config(tmp_path, model_config_data: dict) -> str:
@@ -658,6 +696,155 @@ class TestGenerate:
         assert stats["skipped"] == [2]
         assert stats["prompt_tokens"] == 20
         assert stats["generated_tokens"] == 6
+
+
+# --- Thinking models ------------------------------------------------------------
+
+class TestSplitReasoning:
+
+    @pytest.mark.parametrize("text, expected", [
+        # Qwen3: reasoning in <think> tags before the answer
+        ("<think>\nSome reasoning.\n</think>\n\nThe answer.", ("Some reasoning.", "The answer.")),
+        # DeepSeek-R1: the start tag is part of the prompt, not the output
+        ("Some reasoning.\n</think>\nThe answer.", ("Some reasoning.", "The answer.")),
+        # Cut off during the reasoning: no answer
+        ("<think>\nSome reasoning that never", ("Some reasoning that never", "")),
+        # Thinking switched off: Qwen3 emits an empty think block
+        ("<think>\n\n</think>\n\nThe answer.", ("", "The answer.")),
+        # Non-thinking model: the whole output is the answer
+        ("  The answer.\n", ("", "The answer.")),
+        # Only the first end tag closes the reasoning
+        ("R</think>Answer mentioning </think> literally", ("R", "Answer mentioning </think> literally")),
+    ])
+    def test_splits_reasoning_and_answer(self, bare_model, text, expected):
+        assert bare_model._splitReasoning(text) == expected
+
+    def test_splitting_can_be_disabled(self, bare_model):
+        bare_model.config.reasoning_end_tag = None
+        text = "<think>R</think>A"
+        assert bare_model._splitReasoning(text) == ("", text)
+
+    def test_custom_tags(self, bare_model):
+        bare_model.config.reasoning_start_tag = "<reasoning>"
+        bare_model.config.reasoning_end_tag = "</reasoning>"
+        assert bare_model._splitReasoning("<reasoning>R</reasoning> A") == ("R", "A")
+
+    def test_config_rejects_an_empty_end_tag(self):
+        with pytest.raises(ValidationError):
+            ModelConfig(reasoning_end_tag="")
+
+
+class TestGenerateWithThinkingModels:
+
+    def test_stores_reasoning_separately_from_the_answer(self, bare_model):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["q1"])
+
+        assert bare_model.generate() == 1
+
+        answer = bare_model.messageHistories[0][-1]
+        assert answer[messageTextElement] == '{"answer": "q1"}'
+        assert answer[messageReasoningElement] == 'The user asks q1. Draft: {"draft": true}'
+        # toJSON() reads the answer, not the JSON draft in the reasoning
+        assert bare_model.toJSON(0) == {"answer": "q1"}
+        assert bare_model.truncatedHistories == []
+
+    def test_non_thinking_answers_have_no_reasoning_key(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q1"])
+        bare_model.generate()
+        assert messageReasoningElement not in bare_model.messageHistories[0][-1]
+
+    def test_answer_cut_off_during_reasoning_is_empty_and_flagged(self, bare_model):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["q1", "long question"])
+
+        bare_model.generate()
+
+        cut_off = bare_model.messageHistories[1][-1]
+        assert cut_off[messageTextElement] == ""
+        assert cut_off[messageReasoningElement] == 'Still reasoning about {"draft": true}'
+        assert bare_model.toJSON(1) is None
+        assert bare_model.truncatedHistories == [1]
+
+    def test_reasoning_is_not_sent_back_to_the_model(self, bare_model):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["q1"])
+        bare_model.generate()
+        bare_model.addPrompt(userRole, ["q2"])
+        bare_model.generate()
+
+        sent_histories, _ = bare_model.llm.chat_calls[-1]
+        assert all(set(message) == {messageRoleElement, messageTextElement}
+                   for message in sent_histories[0])
+        checked_history, _ = bare_model.llm.tokenizer.calls[-1]
+        assert all(messageReasoningElement not in message for message in checked_history)
+        # The stored history keeps the reasoning
+        assert messageReasoningElement in bare_model.messageHistories[0][1]
+
+    @pytest.mark.parametrize("enable_thinking", [True, False])
+    def test_passes_enable_thinking_to_chat_and_context_check(self, bare_model, enable_thinking):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.config.enable_thinking = enable_thinking
+        bare_model.addPrompt(userRole, ["q1"])
+
+        bare_model.generate()
+
+        assert bare_model.llm.chat_calls[0][1] == {
+            "chat_template_kwargs": {"enable_thinking": enable_thinking}
+        }
+        assert bare_model.llm.tokenizer.calls[0][1] == {"enable_thinking": enable_thinking}
+
+    def test_leaves_the_template_default_without_enable_thinking(self, bare_model):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["q1"])
+
+        bare_model.generate()
+
+        assert bare_model.llm.chat_calls[0][1] == {}
+        assert bare_model.llm.tokenizer.calls[0][1] == {}
+
+    def test_records_truncation_and_reasoning_tokens_in_run_metadata(self, bare_model):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["q1", "long question"])
+
+        bare_model.generate()
+
+        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        stats = json.loads(open(path, encoding="utf-8").read())[0]["generations"][0]
+        assert stats["truncated"] == [1]
+        # FakeTokenizer.encode: one token per character of both reasonings
+        assert stats["reasoning_tokens"] == (
+            len('The user asks q1. Draft: {"draft": true}')
+            + len('Still reasoning about {"draft": true}')
+        )
+
+    def test_checkpoint_round_trip_keeps_reasoning(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_files = ["prompt_a.md"]
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["q1", "q2"])
+        bare_model.generate()
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.exportHistoriesToFile()
+        header = open(os.path.join(tmp_path, bare_model.config.prompt_tmp_file), encoding="utf-8").readline()
+        assert "prompt_a_reasoning" in header
+
+        bare_model.messageHistories = []
+        bare_model.importHistoriesFromFile()
+        assert bare_model.messageHistories == expected
+
+    def test_checkpoint_without_reasoning_has_no_reasoning_column(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.config.prompt_files = ["prompt_a.md"]
+        bare_model.addPrompt(userRole, ["q1"])
+        bare_model.addPrompt(modelRole, ["a1"])
+
+        bare_model.exportHistoriesToFile()
+
+        header = open(os.path.join(tmp_path, bare_model.config.prompt_tmp_file), encoding="utf-8").readline()
+        assert "reasoning" not in header
 
 
 # --- Model._writeRunMetadata ----------------------------------------------------------

@@ -37,13 +37,22 @@ target_device   = "VLLM_TARGET_DEVICE"
 # ==============================================================================
 messageRoleElement = "role"
 messageTextElement = "content"
+# Reasoning of a thinking model, stored on its answer message next to the
+# answer text. It is not sent back to the model: Model passes only the role
+# and content keys to vLLM and the chat template.
+messageReasoningElement = "reasoning"
 
 # ==============================================================================
 # Checkpoint Column Constants
 # Column of the checkpoint CSV that holds a history's system prompt, so that
-# importHistoriesFromFile() can restore it with the system role.
+# importHistoriesFromFile() can restore it with the system role, and the
+# suffix of the reasoning columns.
 # ==============================================================================
 systemColumn = "system"
+# Suffix of the column holding the reasoning of a turn's answer, e.g.
+# "mapping_reasoning" next to "mapping" and "mapping_answer". Only written
+# for histories with reasoning.
+reasoningColumnSuffix = "_reasoning"
 
 
 # ==============================================================================

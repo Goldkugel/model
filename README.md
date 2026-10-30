@@ -13,6 +13,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 - **Progress logging** — after every chunk the log shows answers and tokens generated, tokens per second, the elapsed time and the estimated remaining time.
 - **Run metadata** — package versions, the model's Hugging Face revision, GPUs, the full configuration, prompt file hashes and generation statistics are written to a JSON file for reproducibility.
 - **Multi-GPU** — all visible GPUs are used via tensor parallelism; Mixture-of-Experts models listed in `expert_parallel_models` additionally get expert parallelism.
+- **Thinking models** — the reasoning of models such as Qwen3 or DeepSeek-R1 is split off their answers and stored separately; thinking can be switched on or off for hybrid models, and answers cut off at `max_tokens` are listed in `truncatedHistories`.
 - **JSON extraction** — `toJSON()` parses the JSON object or array from a model answer, with or without a Markdown code block around it.
 - **Errors raise exceptions** — invalid arguments, missing files and mismatched message counts raise an exception instead of returning an error code.
 - **Prompt logging** — write every message of every history to a semicolon-delimited log file.
@@ -91,6 +92,9 @@ llm:
   dtype: "auto"
   quantization: null
   enable_prefix_caching: true
+  enable_thinking: null
+  reasoning_start_tag: "<think>"
+  reasoning_end_tag: "</think>"
   max_tokens: 2048
   chunk_size: 500
   prompt_tmp_folder: "./data/tmp/"
@@ -117,7 +121,10 @@ llm:
 | `dtype` | `str` | `"auto"` | Data type of weights and activations (`"auto"`, `"bfloat16"`, `"float16"`, ...). |
 | `quantization` | `str` \| `null` | `null` | vLLM quantization method (e.g. `"awq"`, `"gptq"`, `"fp8"`); `null` loads the weights as stored. |
 | `enable_prefix_caching` | `bool` | `true` | Reuse the KV cache of shared prompt prefixes, e.g. a common prompt template. |
-| `max_tokens` | `int` | `2048` | Maximum number of generated tokens per answer. |
+| `enable_thinking` | `bool` \| `null` | `null` | Passed to the chat template as `enable_thinking` to switch thinking on or off for hybrid models such as Qwen3; `null` keeps the template's default. See [Thinking models](#thinking-models). |
+| `reasoning_start_tag` | `str` | `"<think>"` | Marker that opens a thinking model's reasoning. |
+| `reasoning_end_tag` | `str` \| `null` | `"</think>"` | Marker that closes the reasoning; the answer is the text after its first occurrence. `null` stores the whole output as the answer. |
+| `max_tokens` | `int` | `2048` | Maximum number of generated tokens per answer, including a thinking model's reasoning. |
 | `chunk_size` | `int` | `500` | Number of histories generated before a checkpoint is written. |
 | `prompt_tmp_folder` | `str` | `"./data/tmp/"` | Directory of the checkpoint file. |
 | `prompt_tmp_file` | `str` | `"raw.tmp"` | Checkpoint file name. |
@@ -196,6 +203,27 @@ model = Model(ModelConfig(model_id=["google/medgemma-4b-it"]))
 
 If the logger singleton has not been configured yet, it is configured from the same source: the `logger` section of the YAML file, or the `logger` key of a full configuration dict. Otherwise (llm settings only, or a `ModelConfig`) configure it first with `Logger("path/to/config.yaml")`, or it falls back to `./config/config.yaml`.
 
+### Thinking models
+
+Thinking (reasoning) models such as Qwen3 or DeepSeek-R1 write their reasoning between `<think>` and `</think>` before the answer. `generate()` splits it off:
+
+- The **answer** (the text after the first `reasoning_end_tag`) becomes the message text, so `toJSON()` never picks up JSON drafts from the reasoning.
+- The **reasoning** is stored on the same message under the `"reasoning"` key (`messageReasoningElement`). It is not sent back to the model in later turns: only `role` and `content` are passed to vLLM and the chat template.
+- Templates that put `<think>` into the prompt (DeepSeek-R1) are handled; their output only contains `</think>`. Models without these tags are unaffected.
+
+```python
+model.generate()
+answer = model.getMessageHistories()[0][-1]
+answer["content"]     # the answer
+answer["reasoning"]   # the reasoning (key missing for non-thinking answers)
+```
+
+**Settings.** For hybrid models such as Qwen3, `enable_thinking: false` switches thinking off and `true` switches it on; the setting is passed both to `LLM.chat()` and to the context-length check. Reasoning counts towards `max_tokens`, so thinking models need a much larger value (e.g. 8192–32768) and a `max_model_len` that fits prompt plus output. Most model cards also recommend `temperature: 0.6` and `top_p: 0.95` instead of near-greedy decoding, which tends to make the reasoning repeat itself.
+
+**Cut-off answers.** Every answer that stopped at `max_tokens` is listed in `model.truncatedHistories` and in the run metadata. A thinking model cut off during its reasoning gets an empty answer (`toJSON()` returns `None`); it is regenerated when the run is resumed from the checkpoint. With DeepSeek-R1-style templates, an output cut off before `</think>` contains no tag at all, so it is stored as the answer; it is still listed in `truncatedHistories`.
+
+Models that use OpenAI's "harmony" format (gpt-oss) put their reasoning into a separate channel instead of `<think>` tags and are not supported yet.
+
 ### Resuming an interrupted run
 
 `generate()` writes all histories to `prompt_tmp_folder/prompt_tmp_file` after every chunk. To resume, load that checkpoint and call `generate()` again; histories that already end with an answer are skipped. `importHistoriesFromFile()` raises `FileNotFoundError` if there is no checkpoint, i.e. no earlier run to resume:
@@ -209,7 +237,7 @@ except FileNotFoundError:
 model.generate()
 ```
 
-The checkpoint is a semicolon-delimited CSV with one row per history: a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files.
+The checkpoint is a semicolon-delimited CSV with one row per history: a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files. The reasoning of thinking models is stored in an extra `mapping_reasoning` column (only present if some answer of that turn has reasoning) and restored on import.
 
 ### Errors
 
@@ -240,7 +268,7 @@ All methods raise an exception on failure; none returns an error code:
 | `gpus` | Number and names of the GPUs and the CUDA version |
 | `prompt_files` | SHA-256 of every configured prompt file (`null` if missing) |
 | `config` | The complete `llm` configuration |
-| `generations` | One entry per `generate()` call: start and end time, duration, number of histories, answers, skipped history indices, prompt and generated tokens |
+| `generations` | One entry per `generate()` call: start and end time, duration, number of histories, answers, skipped and truncated history indices, prompt and generated tokens, and the approximate number of reasoning tokens |
 
 ### Migrating from 1.x
 
