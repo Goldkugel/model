@@ -4,8 +4,8 @@ The source code of the `model` package (installed from this folder, see `pyproje
 
 | File | Content |
 |---|---|
-| `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `gpu`, `cpu` |
-| `Model.py` | `Model` class: loads a model into vLLM, manages the conversation histories, fills prompt templates, generates answers in chunks (skipping prompts longer than the context, logging progress), writes and reads checkpoints, writes the run metadata, parses JSON answers and frees GPU memory |
+| `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `messageReasoningElement`, `gpu`, `cpu` |
+| `Model.py` | `Model` class: loads a model into vLLM (configured from a YAML file, a dict or a `ModelConfig`), manages the conversation histories, fills prompt templates, generates answers in chunks (skipping prompts longer than the context, splitting off the reasoning of thinking models, logging progress), writes and reads checkpoints, writes the run metadata, parses JSON answers and frees GPU memory |
 | `ModelConfig.py` | `ModelConfig`, the pydantic schema of the `llm` config section |
 | `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log, atomic writers for checkpoints (`writeCheckpointCSV()`) and JSON (`writeJSON()`), and helpers for the run metadata (package versions, model revision, file hashes) |
 | `ModelTest.py` | Pytest suite, plus a GPU diagnostic when run as a script |
@@ -20,7 +20,7 @@ Importing `model` sets the following environment variables, so that vLLM enumera
 
 `CUDA_VISIBLE_DEVICES` is not changed: `Model` uses every GPU it selects (e.g. the GPUs Slurm allocated to the job), or every GPU of the machine if it is not set.
 
-It also sets the `vllm` logger to `ERROR` to suppress vLLM's start-up output.
+It also sets the `vllm` logger to `ERROR` to suppress vLLM's start-up output, and sets `sys.dont_write_bytecode = True`, so Python writes no `.pyc` files for the rest of the process.
 
 ## Message histories
 
@@ -34,6 +34,8 @@ A history is a list of messages in the chat-template format, e.g.:
 ]
 ```
 
+An answer of a thinking model also has a `"reasoning"` key (`messageReasoningElement`) holding its reasoning; only `role` and `content` are sent to the model.
+
 `Model.messageHistories` holds one such list per independent conversation. `generate()` answers every history whose last message is not from the `assistant`, except those whose prompt does not fit into `max_model_len` (listed in `Model.skippedHistories`).
 
 ## Tests
@@ -42,10 +44,10 @@ A history is a list of messages in the chat-template format, e.g.:
 pytest src/ModelTest.py -v
 ```
 
-Run the tests from the repository root. They need neither a GPU nor a downloaded model, and `vllm` and `torch` need not be installed (see `conftest.py` in the repository root). To check the GPU setup on the cluster, submit the diagnostic from this folder (it changes to the project root itself):
+Run the tests from the repository root. They need neither a GPU nor a downloaded model, and `vllm` and `torch` need not be installed (see `conftest.py` in the repository root). To check the GPU setup on the cluster, submit the diagnostic from this folder (it changes to the project root itself). It loads a configured model and generates two short answers; the optional argument is the index of the model in `model_id` (default 0):
 
 ```bash
 sbatch runTest.sh
 ```
 
-Its output is written to `data/slurmlogs/`.
+Its output is written to `data/slurmlogs/`; the checkpoint and run metadata of its test generation go to a temporary folder, whose path it prints.

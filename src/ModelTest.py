@@ -57,7 +57,8 @@ def bare_model(model_config_data, tmp_path) -> Model:
     Model.__init__ requires a real GPU, so tests that only exercise history
     management (addPrompt, export/import, toJSON, ...) construct the object
     via __new__ (bypassing __init__) and set up just the state those methods
-    rely on -- config and messageHistories, with llm left as None.
+    rely on -- config, messageHistories and the run metadata fields, with
+    llm left as None. Tests of generate() assign a FakeLLM.
     """
     model = Model.__new__(Model)
     model.config = ModelConfig.model_validate(model_config_data)

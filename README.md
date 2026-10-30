@@ -237,7 +237,7 @@ except FileNotFoundError:
 model.generate()
 ```
 
-The checkpoint is a semicolon-delimited CSV with one row per history: a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files. The reasoning of thinking models is stored in an extra `mapping_reasoning` column (only present if some answer of that turn has reasoning) and restored on import.
+The checkpoint is a semicolon-delimited CSV with one row per history: a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files. The reasoning of thinking models is stored in an extra `mapping_reasoning` column (only present if some answer of that turn has reasoning) and restored on import. Since the column names are derived from `prompt_files`, resume with the same `prompt_files` the checkpoint was written with.
 
 ### Errors
 

@@ -45,7 +45,8 @@ class ModelConfig(BaseModel):
         description="Top-p (nucleus) sampling threshold."
     )
 
-    # Maximum context length (in tokens) covering combined prompt and output length.
+    # Maximum context length (in tokens) covering combined prompt and output
+    # length. Model.generate() skips histories whose prompt alone reaches it.
     max_model_len: int = Field(
         default=8192,
         gt=0,

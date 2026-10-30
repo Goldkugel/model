@@ -1,11 +1,11 @@
 # Configuration
 
-`config.yaml` is the configuration file read by `Model` (default path: `./config/config.yaml`, relative to the working directory). It has two top-level sections:
+`config.yaml` is the configuration file read by `Model` (default path: `./config/config.yaml`, relative to the working directory). `Model` also accepts the same settings as a dict or a `ModelConfig` instead of a file. It has two top-level sections:
 
 | Section | Read by |
 |---|---|
 | `llm` | `Model` (validated by `ModelConfig`) |
-| `logger` | [`logger`](https://github.com/Goldkugel/logger), which `Model` uses for its run log. The section is required: `logger` fails without it. |
+| `logger` | [`logger`](https://github.com/Goldkugel/logger), which `Model` uses for its run log. If the file passed to `Model` has no `logger` section, the logger falls back to `./config/config.yaml`, and fails if that has none either (see [Configuration sources](../README.md#configuration-sources)). |
 
 When `model` is used inside a larger pipeline, the pipeline's config file may contain further sections (e.g. `adapter`); they are ignored here.
 

@@ -48,7 +48,9 @@ logging.getLogger("vllm").setLevel(logging.ERROR)
 # Ensure CUDA devices are enumerated by PCI bus ID
 # This guarantees consistent GPU ordering across runs
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# Tell vLLM to use its CUDA backend (CPU execution is not supported yet)
+# Tell vLLM to use its CUDA backend (CPU execution is not supported yet).
+# This is also vLLM's default; setting it overrides a "cpu" inherited from
+# the environment, which would select vLLM's CPU backend.
 os.environ[target_device] = "cuda"
 
 # CUDA_VISIBLE_DEVICES is deliberately left alone: it selects the GPUs (e.g.
@@ -482,6 +484,7 @@ class Model:
         tokenizer = self.llm.get_tokenizer()
         chunk_size = self.config.chunk_size
         total = len(unprocessed_indices)
+        # Number of chunks, i.e. total / chunk_size rounded up
         chunk_count = -(-total // chunk_size)
 
         l.log(f"Starting generation for {total} unprocessed histories in {chunk_count} chunk(s) of up to {chunk_size}...")
@@ -526,6 +529,10 @@ class Model:
                     }
                     if reasoning:
                         message[messageReasoningElement] = reasoning
+                        # vLLM only reports the token count of the whole
+                        # output, so the reasoning is tokenized again to
+                        # estimate its share (approximate: the tags and the
+                        # whitespace stripped by _splitReasoning() are lost)
                         reasoning_tokens += len(tokenizer.encode(reasoning, add_special_tokens=False))
                     self.messageHistories[idx].append(message)
                     if getattr(completion, "finish_reason", None) == "length":
@@ -544,6 +551,8 @@ class Model:
             # 5. Log progress, throughput and the estimated remaining time
             chunk_seconds = time.perf_counter() - chunk_start
             elapsed = time.perf_counter() - run_start
+            # Extrapolated from the average time per history so far, skipped
+            # histories included
             remaining = elapsed / done * (total - done)
             l.log(
                 f"Chunk {chunk_number}/{chunk_count}: {len(batch_indices)} answers, "
@@ -743,7 +752,8 @@ class Model:
         or "prompt{turn_idx + 1}" if no prompt file exists at that index
         (e.g. for turns added programmatically rather than from a template
         file). The answer column is the prompt column name with "_answer"
-        appended.
+        appended; the reasoning column of a thinking model's answer is the
+        prompt column name with reasoningColumnSuffix appended.
 
         :param turn_idx: Zero-based index of the prompt/answer turn.
         :return: Tuple of (prompt_column_name, answer_column_name).
@@ -819,7 +829,9 @@ class Model:
 
             rows_data.append(row_dict)
 
-        # 4. Merge converted rows into DataFrame
+        # 4. Build the DataFrame. Its columns are the union of all rows'
+        # keys, so histories with fewer turns get empty cells, which the
+        # import skips.
         df = pd.DataFrame(rows_data)
 
         # 5. Write atomically, so an interrupted write never corrupts the
@@ -838,6 +850,10 @@ class Model:
         from the reasoning columns. Empty cells are skipped, so a history
         whose last answer is missing (e.g. an answer cut off during the
         reasoning) is generated again by generate().
+
+        The column names are derived from config.prompt_files (see
+        _get_column_names()), so the checkpoint must be read with the same
+        prompt_files it was written with.
 
         :return: Total number of message histories populated.
         :raises FileNotFoundError: If the checkpoint file does not exist,
@@ -875,7 +891,8 @@ class Model:
             l.log("DataFrame is empty or None. Cannot populate histories.")
             raise ValueError(f"Checkpoint file '{target_file}' contains no histories.")
 
-        # 2. Identify all prompt/answer column pairs present in the DataFrame
+        # 2. Identify all prompt/answer column pairs present in the DataFrame,
+        # turn by turn until the first turn with neither column
         column_pairs = []
         prompt_counter = 0
 
@@ -942,9 +959,11 @@ class Model:
 
     def toJSON(self, index: int) -> Optional[dict | list]:
         """
-        Parses the last generated model response from the history thread at the
-        given index, extracts the first valid JSON object or array, and
-        converts it into a native Python dict or list.
+        Parses the last model answer of the history at the given index into
+        a native Python value. Tried in this order: the content of the first
+        Markdown code block, the first complete JSON object or array
+        anywhere in the answer, and the whole answer as a bare JSON scalar.
+        Only the answer is searched, never the reasoning of a thinking model.
 
         :param index: Index of the target message history.
         :return: Parsed JSON value, or None if the history has no answer
@@ -1019,8 +1038,9 @@ class Model:
 
     def logPrompts(self) -> None:
         """
-        Writes all recorded conversation histories to a log file defined in 
-        the config.
+        Writes every message of every history to the prompt log
+        (config.prompt_log_folder / config.prompt_log_file), overwriting it;
+        see writePrompt(). The reasoning of thinking models is not logged.
         """
         path = os.path.join(
             self.config.prompt_log_folder, 

@@ -26,7 +26,7 @@ history;prompt;role;length;text
 | `length` | Length of the original message in characters |
 | `text` | The message, with line breaks replaced by spaces and `;` by `,` |
 
-Because the text is altered to keep one message per row, this file is meant for reading only. To save and restore histories, use the checkpoint in [`data/tmp/`](../tmp/README.md).
+The reasoning of thinking models is not logged; it is kept in the checkpoint. Because the text is altered to keep one message per row, this file is meant for reading only. To save and restore histories, use the checkpoint in [`data/tmp/`](../tmp/README.md).
 
 ## `run_metadata.json`
 

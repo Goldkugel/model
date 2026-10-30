@@ -63,7 +63,8 @@ def writePrompt(path: str, histories: list[list[dict]]) -> int:
     """
     Writes prompt and response histories to a semicolon-delimited log file,
     one message per row, for human inspection. The text is sanitized, so
-    unlike the checkpoint the log cannot be read back into histories.
+    unlike the checkpoint the log cannot be read back into histories. Only
+    the message text is written, not the reasoning of thinking models.
 
     :param path: Destination file path for the prompt log.
     :param histories: List of conversation threads, where each thread is a list
@@ -127,6 +128,7 @@ def _writeAtomically(path: str, write) -> None:
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
 
+    # Next to the target, so os.replace() stays within one file system
     tmp_path = path + ".tmp"
     try:
         write(tmp_path)
