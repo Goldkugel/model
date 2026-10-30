@@ -3,6 +3,7 @@ import sys
 # Prevent Python bytecode caching
 sys.dont_write_bytecode = True
 
+import importlib
 import json
 import os
 import pathlib
@@ -12,12 +13,16 @@ import types
 import pytest
 import torch
 import yaml
+from logger import Logger
 from pydantic import ValidationError
 
 from model            import (
     Model, ModelConfig, messageRoleElement, messageTextElement, messageReasoningElement,
 )
-from model.ModelUtils import systemRole, userRole, modelRole, writePrompt
+import model as model_package
+from model.ModelUtils import (
+    systemRole, userRole, modelRole, writePrompt, writeJSON, modelRevision, packageVersions,
+)
 
 # The Model module itself (not the class re-exported as `model.Model`), for
 # monkeypatching names it imported from vllm.
@@ -154,6 +159,20 @@ def _write_yaml_config(tmp_path, model_config_data: dict) -> str:
     return str(config_path)
 
 
+def _fake_engine(monkeypatch, gpus: int = 1) -> dict:
+    """
+    Makes Model.__init__ run without a GPU: torch reports `gpus` CUDA
+    devices, and LLM and SamplingParams record their keyword arguments in
+    the returned dict instead of starting vLLM.
+    """
+    captured = {}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: gpus)
+    monkeypatch.setattr(model_module, "LLM", lambda **kwargs: captured.setdefault("llm", kwargs))
+    monkeypatch.setattr(model_module, "SamplingParams", lambda **kwargs: captured.setdefault("sampling", kwargs))
+    return captured
+
+
 # --- ModelConfig --------------------------------------------------------------
 
 class TestModelConfig:
@@ -273,6 +292,46 @@ class TestModelConfigSources:
         assert model.config.seed == model_config_data["seed"]
 
 
+    def test_constructor_configures_the_logger_from_a_full_dict(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        # Logger is a process-wide singleton; monkeypatch restores its config
+        monkeypatch.setattr(Logger, "config", None)
+        _fake_engine(monkeypatch)
+        model_config_data["metadata_folder"] = str(tmp_path / "logs")
+
+        Model(config={"llm": model_config_data, "logger": {"folder": str(tmp_path / "run")}})
+
+        assert Logger.config.folder == str(tmp_path / "run")
+
+    def test_constructor_configures_the_logger_from_the_yaml_file(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        monkeypatch.setattr(Logger, "config", None)
+        _fake_engine(monkeypatch)
+        model_config_data["metadata_folder"] = str(tmp_path / "logs")
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({
+            "llm": model_config_data, "logger": {"folder": str(tmp_path / "run")}
+        }))
+
+        Model(config=str(config_path))
+
+        assert Logger.config.folder == str(tmp_path / "run")
+
+    def test_constructor_keeps_an_already_configured_logger(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        Logger()
+        configured = Logger.config
+        _fake_engine(monkeypatch)
+        model_config_data["metadata_folder"] = str(tmp_path / "logs")
+
+        Model(config={"llm": model_config_data, "logger": {"folder": str(tmp_path / "run")}})
+
+        assert Logger.config is configured
+
+
 # --- Model constructor guard clauses -------------------------------------------
 
 class TestModelConstructorGuards:
@@ -345,6 +404,41 @@ class TestModelConstructorGuards:
         assert runs[0]["gpus"]["count"] == 1
         assert runs[0]["config"]["dtype"] == "bfloat16"
         assert runs[0]["generations"] == []
+
+
+    def test_shards_the_model_across_every_visible_gpu(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        model_config_data["metadata_folder"] = str(tmp_path / "logs")
+        captured = _fake_engine(monkeypatch, gpus=4)
+
+        model = Model(config=model_config_data)
+
+        assert captured["llm"]["tensor_parallel_size"] == 4
+        assert model.gpuCount == 4
+
+    @pytest.mark.parametrize("index, expected", [(0, True), (1, False)])
+    def test_enables_expert_parallelism_for_listed_models(
+        self, tmp_path, model_config_data, monkeypatch, index, expected
+    ):
+        model_config_data["metadata_folder"] = str(tmp_path / "logs")
+        model_config_data["expert_parallel_models"] = ["model-a"]
+        captured = _fake_engine(monkeypatch)
+
+        Model(config=model_config_data, index=index)
+
+        assert captured["llm"]["enable_expert_parallel"] is expected
+
+    def test_import_keeps_the_gpu_selection(self, monkeypatch):
+        # A selection such as Slurm's must survive importing the module;
+        # it used to be reset to "0,...,n-1".
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+        importlib.reload(model_module)
+
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "2,3"
+        assert os.environ["VLLM_TARGET_DEVICE"] == "cuda"
 
 
 # --- Model.addPrompt -----------------------------------------------------------
@@ -437,6 +531,16 @@ class TestAddPromptFromFile:
 
         with pytest.raises(ValueError):
             bare_model.addPromptFromFile(index=0)
+
+
+    def test_broadcasts_to_existing_histories_and_ignores_amount(self, tmp_path, bare_model):
+        (tmp_path / "prompt_a.md").write_text("Follow-up", encoding="utf-8")
+        bare_model.config.prompt_folder = str(tmp_path)
+        bare_model.addPrompt(userRole, ["a", "b"])
+
+        assert bare_model.addPromptFromFile(index=0, amount=5) == 2
+
+        assert [history[-1][messageTextElement] for history in bare_model.messageHistories] == ["Follow-up"] * 2
 
 
 # --- Model.formatPromptFromFile -------------------------------------------------
@@ -583,6 +687,52 @@ class TestExportImportHistoriesRoundTrip:
             bare_model.importHistoriesFromFile()
 
 
+    def test_round_trip_of_multi_turn_histories_of_different_lengths(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.messageHistories = [
+            [
+                {messageRoleElement: userRole, messageTextElement: "q1"},
+                {messageRoleElement: modelRole, messageTextElement: "a1"},
+                {messageRoleElement: userRole, messageTextElement: "q2"},
+                {messageRoleElement: modelRole, messageTextElement: "a2"},
+            ],
+            [
+                {messageRoleElement: userRole, messageTextElement: "q1"},
+                {messageRoleElement: modelRole, messageTextElement: "a1"},
+            ],
+        ]
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.exportHistoriesToFile()
+        header = (tmp_path / "raw.tmp").read_text(encoding="utf-8").splitlines()[0]
+        assert header == '"prompt_a";"prompt_a_answer";"prompt_b";"prompt_b_answer"'
+
+        bare_model.messageHistories = []
+        bare_model.importHistoriesFromFile()
+
+        assert bare_model.messageHistories == expected
+
+    def test_consecutive_user_prompts_get_their_own_columns(self, tmp_path, bare_model):
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.addPrompt(userRole, ["first"])
+        bare_model.addPrompt(userRole, ["second"])
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.exportHistoriesToFile()
+        bare_model.messageHistories = []
+        bare_model.importHistoriesFromFile()
+
+        assert bare_model.messageHistories == expected
+
+    def test_import_without_prompt_columns_raises(self, tmp_path, bare_model):
+        # E.g. a checkpoint written with other prompt_files
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        (tmp_path / "raw.tmp").write_text('"other";"other_answer"\n"q";"a"\n', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="no prompt/answer columns"):
+            bare_model.importHistoriesFromFile()
+
+
 # --- Model.toJSON ----------------------------------------------------------------
 
 class TestToJSON:
@@ -625,6 +775,31 @@ class TestToJSON:
     def test_raises_for_out_of_bounds_index(self, bare_model):
         with pytest.raises(IndexError):
             bare_model.toJSON(0)
+
+
+    def test_falls_back_when_the_code_block_is_not_json(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+        bare_model.addPrompt(modelRole, ['Draft:\n```\nnot json\n```\nFinal: {"label": "kidney"}'])
+
+        assert bare_model.toJSON(0) == {"label": "kidney"}
+
+    def test_extracts_json_array(self, bare_model):
+        bare_model.addPrompt(userRole, ["list them"])
+        bare_model.addPrompt(modelRole, ['The labels are ["kidney", "liver"].'])
+
+        assert bare_model.toJSON(0) == ["kidney", "liver"]
+
+    def test_parses_a_bare_scalar(self, bare_model):
+        bare_model.addPrompt(userRole, ["rate this"])
+        bare_model.addPrompt(modelRole, ["7"])
+
+        assert bare_model.toJSON(0) == 7
+
+    def test_returns_none_for_an_empty_answer(self, bare_model):
+        bare_model.addPrompt(userRole, ["classify this"])
+        bare_model.addPrompt(modelRole, ["   "])
+
+        assert bare_model.toJSON(0) is None
 
 
 # --- Model.reset / getMessageHistories --------------------------------------------
@@ -698,6 +873,67 @@ class TestGenerate:
         assert stats["skipped"] == [2]
         assert stats["prompt_tokens"] == 20
         assert stats["generated_tokens"] == 6
+
+
+class InterruptedLLM(FakeLLM):
+    """FakeLLM whose second chat() call fails, like a job killed mid-run."""
+
+    def chat(self, histories, sampling_params, use_tqdm, **kwargs):
+        if self.batches:
+            raise RuntimeError("job killed")
+        return super().chat(histories, sampling_params, use_tqdm, **kwargs)
+
+
+class BatchEncodingTokenizer(FakeTokenizer):
+    """Tokenizer returning a dict-like BatchEncoding, as some transformers versions do."""
+
+    def apply_chat_template(self, history, tokenize, add_generation_prompt, **kwargs):
+        return {"input_ids": super().apply_chat_template(history, tokenize, add_generation_prompt, **kwargs)}
+
+
+class TestGenerateResumeAndTurns:
+
+    def test_resumes_from_the_checkpoint_after_an_interruption(self, bare_model):
+        bare_model.config.chunk_size = 2
+        bare_model.addPrompt(userRole, ["a", "b", "c", "d"])
+        bare_model.llm = InterruptedLLM()
+
+        with pytest.raises(RuntimeError, match="job killed"):
+            bare_model.generate()
+
+        # A new run loads the checkpoint of the first chunk ...
+        bare_model.reset()
+        bare_model.importHistoriesFromFile()
+        assert [len(history) for history in bare_model.messageHistories] == [2, 2, 1, 1]
+
+        # ... and only generates the histories without an answer
+        bare_model.llm = FakeLLM()
+        assert bare_model.generate() == 2
+        assert bare_model.llm.batches == [2]
+        assert [history[-1][messageTextElement] for history in bare_model.messageHistories] == [
+            "answer to a", "answer to b", "answer to c", "answer to d"
+        ]
+
+    def test_second_turn_sends_the_whole_conversation(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["first"])
+        bare_model.generate()
+        bare_model.addPrompt(userRole, ["second"])
+
+        assert bare_model.generate() == 1
+
+        sent, _ = bare_model.llm.chat_calls[-1]
+        assert [message[messageTextElement] for message in sent[0]] == ["first", "answer to first", "second"]
+        assert bare_model.messageHistories[0][-1][messageTextElement] == "answer to second"
+
+    def test_context_check_accepts_a_batch_encoding(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.llm.tokenizer = BatchEncodingTokenizer()
+        bare_model.config.max_model_len = 10
+        bare_model.addPrompt(userRole, ["short", "x" * 10])
+
+        assert bare_model.generate() == 1
+        assert bare_model.skippedHistories == [1]
 
 
 # --- Thinking models ------------------------------------------------------------
@@ -935,6 +1171,41 @@ class TestClose:
         assert calls == []
 
 
+    def _record_cleanup(self, monkeypatch, failing: str = "") -> list:
+        """Replaces the cleanup steps of close() by recorders; `failing` raises."""
+        calls = []
+
+        def step(name):
+            def run():
+                calls.append(name)
+                if name == failing:
+                    raise RuntimeError(name)
+            return run
+
+        monkeypatch.setattr(model_module, "destroy_model_parallel", step("parallel"))
+        monkeypatch.setattr(model_module, "destroy_distributed_environment", step("env"))
+        monkeypatch.setattr(torch.distributed, "destroy_process_group", step("group"))
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "empty_cache", step("cache"), raising=False)
+        return calls
+
+    def test_close_releases_the_engine_and_gpu_memory(self, bare_model, monkeypatch):
+        calls = self._record_cleanup(monkeypatch)
+        bare_model.llm = object()
+
+        bare_model.close()
+
+        assert bare_model.llm is None
+        assert calls == ["parallel", "env", "group", "cache"]
+
+    def test_close_continues_after_a_failing_cleanup_step(self, bare_model, monkeypatch):
+        calls = self._record_cleanup(monkeypatch, failing="parallel")
+
+        bare_model.close()
+
+        assert calls == ["parallel", "env", "group", "cache"]
+
+
 # --- ModelUtils.writePrompt ---------------------------------------------------------
 
 class TestWritePrompt:
@@ -966,6 +1237,118 @@ class TestWritePrompt:
         content = open(path, encoding="utf-8").read()
         assert "line one,line two line three" in content
         assert content.count("\n") == 2  # header + one data row
+
+
+# --- ModelUtils: atomic writes and run metadata helpers ------------------------------
+
+class TestModelUtils:
+
+    def test_failed_write_keeps_the_previous_file(self, tmp_path):
+        path = str(tmp_path / "data.json")
+        writeJSON({"version": 1}, path)
+
+        # object() is not JSON-serializable, so the write fails halfway
+        with pytest.raises(TypeError):
+            writeJSON({"version": 2, "broken": object()}, path)
+
+        assert json.loads(open(path, encoding="utf-8").read()) == {"version": 1}
+        assert sorted(os.listdir(tmp_path)) == ["data.json"]
+
+    def test_package_versions_of_missing_packages_are_none(self):
+        versions = packageVersions(["model", "no-such-package-xyz"])
+        assert versions["model"] is not None
+        assert versions["no-such-package-xyz"] is None
+
+    def test_model_revision_of_a_local_directory_is_none(self, tmp_path):
+        assert modelRevision(str(tmp_path)) is None
+
+    def test_model_revision_is_the_cached_snapshot_hash(self, tmp_path, monkeypatch):
+        snapshot = tmp_path / "models--org--name" / "snapshots" / "abc123"
+        hub = types.ModuleType("huggingface_hub")
+        hub.snapshot_download = lambda model_id, local_files_only: str(snapshot) + os.sep
+        monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+        assert modelRevision("org/name") == "abc123"
+
+    def test_model_revision_without_a_cached_snapshot_is_none(self, monkeypatch):
+        def not_cached(model_id, local_files_only):
+            raise FileNotFoundError(model_id)
+        hub = types.ModuleType("huggingface_hub")
+        hub.snapshot_download = not_cached
+        monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+        assert modelRevision("org/name") is None
+
+
+# --- Package exports -------------------------------------------------------------------
+
+class TestPackageExports:
+
+    def test_every_exported_name_is_importable(self):
+        assert set(model_package.__all__) == {
+            "Model", "ModelConfig", "messageRoleElement", "messageTextElement",
+            "messageReasoningElement", "gpu", "cpu",
+        }
+        for name in model_package.__all__:
+            assert getattr(model_package, name) is not None
+
+
+# --- GPU diagnostic ----------------------------------------------------------------------
+
+class DiagnosticLLM(FakeLLM):
+    """FakeLLM answering the diagnostic prompts correctly, or cut off."""
+
+    finish_reason = "stop"
+
+    def answer(self, history) -> tuple[str, str]:
+        if "JSON" in history[-1][messageTextElement]:
+            return '{"answer": 4}', self.finish_reason
+        return "A small head.", self.finish_reason
+
+
+class TestGpuDiagnostic:
+    """
+    Runs main() with vLLM and the GPU replaced, so the diagnostic submitted
+    by runTest.sh cannot break unnoticed. It reads ./config/config.yaml,
+    like the other tests run from the repository root.
+    """
+
+    @pytest.fixture
+    def diagnostic(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["ModelTest.py"])
+        monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(tmp_path))
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "Fake GPU", raising=False)
+        monkeypatch.setattr(model_module, "SamplingParams", lambda **kwargs: None)
+        monkeypatch.setattr(model_module, "LLM", lambda **kwargs: DiagnosticLLM())
+        return tmp_path
+
+    def test_passes_with_a_working_model(self, diagnostic, capsys):
+        main()
+
+        output = capsys.readouterr().out
+        assert "ALL CHECKS PASSED" in output
+        assert "WARNING" not in output
+        # The test generation does not touch the checkpoint of a real run
+        assert (diagnostic / "prompts_raw.tmp").is_file()
+
+    def test_fails_when_answers_are_cut_off(self, diagnostic, monkeypatch, capsys):
+        monkeypatch.setattr(DiagnosticLLM, "finish_reason", "length")
+
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+
+        assert exit_info.value.code == 1
+        assert "cut off at max_tokens" in capsys.readouterr().out
+
+    def test_fails_without_cuda(self, diagnostic, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+
+        assert exit_info.value.code == 1
 
 
 # ==============================================================================

@@ -41,10 +41,10 @@ An answer of a thinking model also has a `"reasoning"` key (`messageReasoningEle
 ## Tests
 
 ```bash
-pytest src/ModelTest.py -v
+pytest -v
 ```
 
-Run the tests from the repository root. They need neither a GPU nor a downloaded model, and `vllm` and `torch` need not be installed (see `conftest.py` in the repository root). To check the GPU setup on the cluster, submit the diagnostic from this folder (it changes to the project root itself). It loads a configured model and generates two short answers; the optional argument is the index of the model in `model_id` (default 0):
+Run the tests from the repository root; `pytest` collects every `*Test.py` file in this folder. They need neither a GPU nor a downloaded model, and `vllm` and `torch` need not be installed (see `conftest.py` in the repository root). To check the GPU setup on the cluster, submit the diagnostic from this folder (it changes to the project root itself). It loads a configured model and generates two short answers; the optional argument is the index of the model in `model_id` (default 0):
 
 ```bash
 sbatch runTest.sh

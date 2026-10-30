@@ -44,5 +44,7 @@ jobs:
             "logger @ git+https://github.com/Goldkugel/logger.git@v1.1.0" \
             pandas "pydantic>=2" pyyaml pytest
 
+      # Runs every *Test.py file in src/ (see [tool.pytest.ini_options] in
+      # pyproject.toml), including the GPU diagnostic with vLLM replaced.
       - name: Run tests
-        run: python -m pytest src/ModelTest.py -v
+        run: python -m pytest -v

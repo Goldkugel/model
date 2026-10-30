@@ -25,3 +25,8 @@ packages = ["model"]
 
 [tool.setuptools.package-dir]
 "model" = "src"
+# `pytest` without arguments runs every *Test.py file in src/ (pytest's
+# default would only collect test_*.py and *_test.py files)
+[tool.pytest.ini_options]
+testpaths = ["src"]
+python_files = ["*Test.py"]

@@ -292,10 +292,10 @@ Version 2.1 is compatible with 2.0; existing code and configuration files keep w
 The test suite needs neither a GPU nor a downloaded model, nor `vllm` and `torch` installed: tests that touch the engine replace `torch.cuda` and the vLLM classes via `monkeypatch`, and [`conftest.py`](./conftest.py) registers stand-ins for `vllm` and `torch` if they are not installed. Run the tests from the repository root, since the logger reads `./config/config.yaml`:
 
 ```bash
-pytest src/ModelTest.py -v
+pytest -v
 ```
 
-The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
+`pytest` collects every `*Test.py` file in `src/` (configured in `pyproject.toml`). Besides the methods of `Model`, the tests cover resuming an interrupted run from its checkpoint, the GPU and logger set-up of the constructor, the helpers in `ModelUtils.py`, and the GPU diagnostic below, run with vLLM replaced. The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
 
 `src/ModelTest.py` can also be run directly as a GPU diagnostic: it loads a configured model and generates answers to two short prompts, checking that none is skipped or cut off and that `toJSON()` parses a JSON answer. Its checkpoint and run metadata go to a temporary folder, so the checkpoint of a real run is not overwritten. `src/runTest.sh` submits it as a Slurm job, writing its output to `data/slurmlogs/`; pass the index of the model in `model_id` to test another model than the first, e.g. a thinking model:
 
