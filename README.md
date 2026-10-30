@@ -174,6 +174,28 @@ model.addPrompt(role="user", message=["What is microcephaly?"])
 model.generate()
 ```
 
+### Configuration sources
+
+Besides a YAML path, `Model` accepts a dict or a `ModelConfig`:
+
+```python
+from model import Model, ModelConfig
+
+# From a YAML file (default: "./config/config.yaml" relative to the
+# working directory). A pathlib.Path works as well.
+model = Model("./config/config.yaml", index=0)
+
+# From a dict: either the whole configuration (with "llm" and optionally
+# "logger" keys) or just the llm settings.
+model = Model({"llm": {"model_id": ["google/medgemma-4b-it"]}, "logger": {"folder": "./data/logs/"}})
+model = Model({"model_id": ["google/medgemma-4b-it"]})
+
+# From a ModelConfig (a copy is stored).
+model = Model(ModelConfig(model_id=["google/medgemma-4b-it"]))
+```
+
+If the logger singleton has not been configured yet, it is configured from the same source: the `logger` section of the YAML file, or the `logger` key of a full configuration dict. Otherwise (llm settings only, or a `ModelConfig`) configure it first with `Logger("path/to/config.yaml")`, or it falls back to `./config/config.yaml`.
+
 ### Resuming an interrupted run
 
 `generate()` writes all histories to `prompt_tmp_folder/prompt_tmp_file` after every chunk. To resume, load that checkpoint and call `generate()` again; histories that already end with an answer are skipped. `importHistoriesFromFile()` raises `FileNotFoundError` if there is no checkpoint, i.e. no earlier run to resume:
@@ -195,6 +217,7 @@ All methods raise an exception on failure; none returns an error code:
 
 | Method | Raises |
 |---|---|
+| `Model()` | `FileNotFoundError` for a missing config file, `KeyError` if it has no `llm` section, `pydantic.ValidationError` for unknown keys or invalid values, `ValueError` for an invalid model index, `RuntimeError` if no CUDA device is visible |
 | `addPrompt()` | `ValueError` if the number of messages is neither 1, nor the number of histories, nor used to create new histories |
 | `addPromptFromFile()` | `IndexError` for an invalid prompt index, `FileNotFoundError` for a missing prompt file, `ValueError` if `prompt_folder` is empty or `amount` is missing for empty histories |
 | `formatPromptFromFile()` | `IndexError` for an invalid history index, `KeyError` for a placeholder without a value, `ValueError` for a malformed template (e.g. an unescaped `{`) |

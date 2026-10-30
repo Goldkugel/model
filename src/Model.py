@@ -22,7 +22,7 @@ from .ModelUtils        import (
     fileSHA256,
     target_device,
 )
-from logger             import Logger
+from logger             import Logger, LoggerConfig
 from pathlib            import Path
 from datetime           import datetime
 import pandas           as pd
@@ -60,6 +60,8 @@ if detected_gpu_count > 0:
 # Global configuration constants
 # YAML key where LLM config options are stored
 configuration_section: str = "llm"       
+# YAML key of the logger settings in the same file (see the logger package)
+logger_section: str = "logger"
 # Default path for the configuration file
 standard_directory: str = "./config/config.yaml"  
 
@@ -80,23 +82,36 @@ class Model:
     batch prompt formatting, text generation, and GPU resource cleanup.
     """
 
-    def __init__(self, config: str = standard_directory, index: int = 0):
+    def __init__(
+        self,
+        config: str | os.PathLike | dict | ModelConfig = standard_directory,
+        index: int = 0,
+    ):
         """
         Load and validate configuration, select the model at `index`, and
         initialize the vLLM engine on GPU.
 
-        :param config: Path to the YAML configuration file containing the
-            "llm" section (validated against ModelConfig).
+        :param config: Where the settings come from:
+            - a path to a YAML configuration file with an "llm" section
+              (default: ./config/config.yaml relative to the working
+              directory);
+            - a dict, either the content of such a file (with "llm" and
+              optionally "logger" keys) or just the llm settings themselves;
+            - a ready ModelConfig (a copy is stored).
+            If the Logger has not been configured yet, it is configured from
+            the same source: the "logger" section of the file, or the
+            "logger" key of a full configuration dict.
         :param index: Index into config.model_id selecting which configured
             model to load.
         :raises FileNotFoundError: If the config file does not exist.
+        :raises KeyError: If the config file has no "llm" section.
+        :raises pydantic.ValidationError: If the llm settings contain unknown
+            keys or invalid values.
         :raises ValueError: If `index` is out of range for config.model_id.
         :raises RuntimeError: If no CUDA device is available or visible to
             PyTorch. This also applies when config.device is "cpu", since
             CPU execution is not supported yet.
         """
-        l = Logger()
-
         self.messageHistories: list[list[dict]] = []
         self.llm: Optional[LLM] = None
         self.sampling_params: Optional[SamplingParams] = None
@@ -114,15 +129,18 @@ class Model:
         self.generationStats: list[dict] = []
 
         # --- Step 1: Load and Validate Configuration ---
-        config_path = Path(config)
-        if not config_path.is_file():
-            l.log(f"Config file not found at '{config}'")
-            raise FileNotFoundError(f"Config file not found at '{config}'")
+        self.config, logger_path, logger_settings = Model._resolveConfig(config)
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-
-        self.config = ModelConfig.model_validate(data[configuration_section])
+        # The Logger is a process-wide singleton. If the entry point has not
+        # configured it yet, configure it from the same source as the model:
+        # the same YAML file, or the "logger" key of the same dict. Without
+        # either, Logger() falls back to ./config/config.yaml.
+        if Logger.config is None and logger_path is not None:
+            l = Logger(logger_path)
+        else:
+            if Logger.config is None and logger_settings is not None:
+                Logger.config = LoggerConfig.model_validate(logger_settings)
+            l = Logger()
 
         # --- Step 2: Validate Model Selection Index ---
         if not (0 <= index < len(self.config.model_id)):
@@ -199,6 +217,52 @@ class Model:
 
         # --- Step 6: Record versions, model revision and GPUs ---
         self._writeRunMetadata()
+
+    @staticmethod
+    def _resolveConfig(
+        config: str | os.PathLike | dict | ModelConfig,
+    ) -> tuple[ModelConfig, Optional[str], Optional[dict]]:
+        """
+        Turn the `config` argument of __init__ into a ModelConfig.
+
+        Returns the ModelConfig, the YAML file it came from if that file has
+        a "logger" section (or None), and the "logger" section of a full
+        configuration dict (or None), so __init__ can configure the Logger
+        from the same source.
+
+        :raises FileNotFoundError: If the config file does not exist.
+        :raises KeyError: If the config file has no "llm" section.
+        """
+        # Copy a given ModelConfig so later changes by the caller do not
+        # silently change the model's configuration.
+        if isinstance(config, ModelConfig):
+            return config.model_copy(deep=True), None, None
+
+        if isinstance(config, dict):
+            # A full configuration (the parsed YAML file) has an "llm" key,
+            # which is not a valid llm setting itself, so the two kinds of
+            # dict cannot be confused.
+            if configuration_section in config:
+                section = config[configuration_section] or {}
+                return ModelConfig.model_validate(section), None, config.get(logger_section)
+            return ModelConfig.model_validate(config), None, None
+
+        path = os.fspath(config)
+        if not Path(path).is_file():
+            Logger().log(f"Config file not found at '{path}'")
+            raise FileNotFoundError(f"Config file not found at '{path}'")
+
+        # An empty file parses to None, so fall back to an empty dict to get
+        # the clearer "missing section" error below instead of a TypeError.
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        if configuration_section not in data:
+            raise KeyError(f"Config file '{path}' has no '{configuration_section}' section.")
+
+        # Only hand the path on to the Logger if the file has logger settings.
+        logger_path = path if logger_section in data else None
+        return ModelConfig.model_validate(data[configuration_section] or {}), logger_path, None
 
     def addPrompt(self, role: str = userRole, message: Optional[list[str]] = None) -> int:
         """

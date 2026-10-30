@@ -5,6 +5,7 @@ sys.dont_write_bytecode = True
 
 import json
 import os
+import pathlib
 import types
 
 import pytest
@@ -157,6 +158,79 @@ class TestModelConfig:
         model_config_data["expert_parallel_models"] = ["Mixtral", "DeepSeek"]
         config = ModelConfig.model_validate(model_config_data)
         assert config.expert_parallel_models == ["Mixtral", "DeepSeek"]
+
+
+# --- Configuration sources -----------------------------------------------------
+
+class TestModelConfigSources:
+    """
+    Model(config=...) accepts a YAML path, a dict (the whole configuration or
+    just the llm section) or a ModelConfig. Tested via Model._resolveConfig,
+    plus one constructor run with vLLM replaced.
+    """
+
+    def test_accepts_a_path_and_a_path_object(self, tmp_path, model_config_data):
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        for source in (config_path, pathlib.Path(config_path)):
+            config, logger_path, logger_settings = Model._resolveConfig(source)
+            assert config == ModelConfig.model_validate(model_config_data)
+            # The file has no logger section, so the Logger is left alone.
+            assert logger_path is None
+            assert logger_settings is None
+
+    def test_path_with_logger_section_is_handed_to_the_logger(self, tmp_path, model_config_data):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({"llm": model_config_data, "logger": {}}))
+        _, logger_path, _ = Model._resolveConfig(str(config_path))
+        assert logger_path == str(config_path)
+
+    def test_missing_section_raises_key_error(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("other: {}\n")
+        with pytest.raises(KeyError, match="llm"):
+            Model._resolveConfig(str(config_path))
+
+    def test_accepts_a_dict_of_llm_settings(self, model_config_data):
+        config, logger_path, logger_settings = Model._resolveConfig(model_config_data)
+        assert config == ModelConfig.model_validate(model_config_data)
+        assert logger_path is None
+        assert logger_settings is None
+
+    def test_accepts_a_full_configuration_dict(self, model_config_data):
+        logger_data = {"folder": "./data/logs/"}
+        config, logger_path, logger_settings = Model._resolveConfig(
+            {"llm": model_config_data, "logger": logger_data}
+        )
+        assert config == ModelConfig.model_validate(model_config_data)
+        assert logger_path is None
+        assert logger_settings == logger_data
+
+    def test_empty_section_in_a_dict_falls_back_to_defaults(self):
+        config, _, _ = Model._resolveConfig({"llm": None})
+        assert config == ModelConfig()
+
+    def test_rejects_unknown_keys_in_a_dict(self):
+        with pytest.raises(ValidationError):
+            Model._resolveConfig({"invalid_param": 123})
+
+    def test_accepts_a_model_config_and_copies_it(self, model_config_data):
+        original = ModelConfig.model_validate(model_config_data)
+        config, logger_path, logger_settings = Model._resolveConfig(original)
+        assert config == original
+        assert config is not original
+        assert logger_path is None
+        assert logger_settings is None
+
+    def test_constructor_uses_a_dict(self, tmp_path, model_config_data, monkeypatch):
+        model_config_data["metadata_folder"] = str(tmp_path / "logs")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+        monkeypatch.setattr(model_module, "LLM", lambda **kwargs: None)
+        monkeypatch.setattr(model_module, "SamplingParams", lambda **kwargs: None)
+
+        model = Model(config={"llm": model_config_data}, index=1)
+        assert model.model == "dummy/model-b"
+        assert model.config.seed == model_config_data["seed"]
 
 
 # --- Model constructor guard clauses -------------------------------------------
