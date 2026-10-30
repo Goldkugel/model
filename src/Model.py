@@ -51,13 +51,9 @@ os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # Tell vLLM to use its CUDA backend (CPU execution is not supported yet)
 os.environ[target_device] = "cuda"
 
-# Expose every CUDA device PyTorch can see to vLLM. This is not config-driven
-# (it runs at import time, before any config file is loaded) -- vLLM is later
-# given tensor_parallel_size=gpus using this same device count, so the two
-# must stay in sync.
-detected_gpu_count = int(torch.cuda.device_count())
-if detected_gpu_count > 0:
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(detected_gpu_count))
+# CUDA_VISIBLE_DEVICES is deliberately left alone: it selects the GPUs (e.g.
+# set by Slurm), and vLLM uses all of them via tensor_parallel_size, which
+# __init__ takes from torch.cuda.device_count() within that selection.
 
 # Global configuration constants
 # YAML key where LLM config options are stored

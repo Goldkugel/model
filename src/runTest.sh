@@ -1,7 +1,9 @@
 #!/bin/bash
 # Slurm job running the GPU diagnostic in ModelTest.py: checks that CUDA is
-# visible and that the first configured model loads. Submit from src/:
-#   sbatch runTest.sh
+# visible, that a configured model loads and that it generates answers.
+# Submit from src/, optionally with the index of the model in
+# config.model_id (default 0):
+#   sbatch runTest.sh [index]
 # Paths in the #SBATCH lines are relative to the submission folder (src/).
 #SBATCH --job-name=modeltest
 #SBATCH --partition=batch_long
@@ -15,4 +17,4 @@
 # Run from the repository root, where ./config/config.yaml is found
 cd ..
 
-python3 ./src/ModelTest.py
+python3 ./src/ModelTest.py "$@"

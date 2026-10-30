@@ -50,7 +50,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 
 - Python 3.10+
 - A CUDA-capable GPU
-- [`vllm`](https://github.com/vllm-project/vllm), [`torch`](https://pytorch.org/), [`pandas`](https://pandas.pydata.org/), [`pydantic`](https://docs.pydantic.dev/) 2.x, [`PyYAML`](https://pyyaml.org/) and [`logger`](https://github.com/Goldkugel/logger)
+- [`vllm`](https://github.com/vllm-project/vllm) 0.9 or newer, [`torch`](https://pytorch.org/), [`pandas`](https://pandas.pydata.org/), [`pydantic`](https://docs.pydantic.dev/) 2.x, [`PyYAML`](https://pyyaml.org/) and [`logger`](https://github.com/Goldkugel/logger)
 
 All dependencies are declared in `pyproject.toml` and installed with the package:
 
@@ -270,6 +270,15 @@ All methods raise an exception on failure; none returns an error code:
 | `config` | The complete `llm` configuration |
 | `generations` | One entry per `generate()` call: start and end time, duration, number of histories, answers, skipped and truncated history indices, prompt and generated tokens, and the approximate number of reasoning tokens |
 
+### Changes in 2.1
+
+Version 2.1 is compatible with 2.0; existing code and configuration files keep working.
+
+- `Model(config=...)` also accepts a dict or a `ModelConfig` instead of a file path.
+- Thinking models: the reasoning is stored apart from the answer, and answers cut off at `max_tokens` are listed in `truncatedHistories` (see [Thinking models](#thinking-models)). New, optional config options: `enable_thinking`, `reasoning_start_tag`, `reasoning_end_tag`.
+- Importing `model` no longer overwrites `CUDA_VISIBLE_DEVICES`, so the GPUs selected by Slurm or by hand are used.
+- `vllm` 0.9 or newer is required.
+
 ### Migrating from 1.x
 
 - Methods that returned `-1` now raise an exception (see [Errors](#errors)); replace checks such as `if model.importHistoriesFromFile() > 0:` by `try`/`except FileNotFoundError`.
@@ -288,10 +297,10 @@ pytest src/ModelTest.py -v
 
 The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
 
-`src/ModelTest.py` can also be run directly as a GPU diagnostic that loads the configured model; `src/runTest.sh` submits it as a Slurm job, writing its output to `data/slurmlogs/`:
+`src/ModelTest.py` can also be run directly as a GPU diagnostic: it loads a configured model and generates answers to two short prompts, checking that none is skipped or cut off and that `toJSON()` parses a JSON answer. Its checkpoint and run metadata go to a temporary folder, so the checkpoint of a real run is not overwritten. `src/runTest.sh` submits it as a Slurm job, writing its output to `data/slurmlogs/`; pass the index of the model in `model_id` to test another model than the first, e.g. a thinking model:
 
 ```bash
-cd src && sbatch runTest.sh
+cd src && sbatch runTest.sh 1
 ```
 
 ## License

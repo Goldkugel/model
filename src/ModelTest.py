@@ -6,6 +6,7 @@ sys.dont_write_bytecode = True
 import json
 import os
 import pathlib
+import tempfile
 import types
 
 import pytest
@@ -968,10 +969,20 @@ class TestWritePrompt:
 
 # ==============================================================================
 # Manual Slurm/GPU diagnostic (not a pytest test) -- see src/runTest.sh.
-# Run directly with `python3 src/ModelTest.py` on a GPU node.
+# Run directly with `python3 src/ModelTest.py [index]` on a GPU node, from the
+# repository root; `index` selects the model in config.model_id (default 0).
 # ==============================================================================
 
+# Prompts of the smoke test: the first checks toJSON(), the second a free answer
+diagnostic_prompts = [
+    'Reply with only this JSON object and nothing else: {"answer": 4}',
+    "Name one symptom of microcephaly in one sentence.",
+]
+
+
 def main():
+    index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+
     print("=" * 50)
     print("SLURM & GPU ENVIRONMENT DIAGNOSTIC")
     print("=" * 50)
@@ -997,16 +1008,60 @@ def main():
     print("INITIALIZING MODEL")
     print("=" * 50)
 
-    # 2. Load the first configured model into vLLM
+    # 2. Load the selected model into vLLM. The checkpoint and run metadata
+    # of the test generation go to a temporary folder, so the checkpoint of
+    # a real run is never overwritten.
+    with open("./config/config.yaml", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    output_dir = tempfile.mkdtemp(prefix="modeltest_")
+    config["llm"]["prompt_tmp_folder"] = output_dir
+    config["llm"]["metadata_folder"] = output_dir
+
     try:
-        model = Model()
-        print("✅ Model successfully initialized.")
+        model = Model(config, index=index)
+        print(f"✅ Model '{model.model}' successfully initialized.")
     except Exception as e:
         print(f"\n❌ ERROR initializing Model: {e}")
         sys.exit(1)
 
-    # 3. Free GPU memory and shut down vLLM's distributed environment
-    model.close()
+    print("\n" + "=" * 50)
+    print("GENERATING")
+    print("=" * 50)
+    print(f"enable_thinking      : {model.config.enable_thinking}")
+    print(f"Output folder        : {output_dir}")
+
+    # 3. Generate an answer for every diagnostic prompt
+    errors = []
+    try:
+        model.addPrompt(userRole, diagnostic_prompts)
+        generated = model.generate()
+
+        for idx, history in enumerate(model.getMessageHistories()):
+            message = history[-1]
+            print(f"\n--- History {idx} ---")
+            print(f"Prompt   : {history[0][messageTextElement]}")
+            print(f"Reasoning: {len(message.get(messageReasoningElement, ''))} characters")
+            print(f"Answer   : {message.get(messageTextElement, '') if message[messageRoleElement] == modelRole else '(none)'}")
+
+        if generated != len(diagnostic_prompts):
+            errors.append(f"{generated} of {len(diagnostic_prompts)} answers generated.")
+        if model.skippedHistories:
+            errors.append(f"Histories {model.skippedHistories} exceed max_model_len.")
+        if model.truncatedHistories:
+            errors.append(f"Histories {model.truncatedHistories} were cut off at max_tokens "
+                          f"({model.config.max_tokens}); increase max_tokens for thinking models.")
+        if model.toJSON(0) != {"answer": 4}:
+            print("\n⚠️  WARNING: toJSON() did not return {\"answer\": 4} for history 0.")
+    except Exception as e:
+        errors.append(f"Generation failed: {e!r}")
+    finally:
+        # 4. Free GPU memory and shut down vLLM's distributed environment
+        model.close()
+
+    if errors:
+        for error in errors:
+            print(f"\n❌ ERROR: {error}")
+        sys.exit(1)
 
     print("\n🎉 ALL CHECKS PASSED SUCCESSFULLY!")
 

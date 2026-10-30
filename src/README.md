@@ -13,11 +13,12 @@ The source code of the `model` package (installed from this folder, see `pyproje
 
 ## Import side effects
 
-Importing `model` sets the following environment variables, so that vLLM uses every GPU in a fixed order:
+Importing `model` sets the following environment variables, so that vLLM enumerates the GPUs in a fixed order:
 
 - `CUDA_DEVICE_ORDER=PCI_BUS_ID`
 - `VLLM_TARGET_DEVICE=cuda`
-- `CUDA_VISIBLE_DEVICES=0,…,n-1` for the *n* GPUs PyTorch detects
+
+`CUDA_VISIBLE_DEVICES` is not changed: `Model` uses every GPU it selects (e.g. the GPUs Slurm allocated to the job), or every GPU of the machine if it is not set.
 
 It also sets the `vllm` logger to `ERROR` to suppress vLLM's start-up output.
 
