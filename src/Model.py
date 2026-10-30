@@ -10,6 +10,8 @@ from .ModelUtils        import (
     systemRole,
     userRole,
     modelRole,
+    chatRoles,
+    cpu,
     messageRoleElement,
     messageTextElement,
     messageReasoningElement,
@@ -158,6 +160,8 @@ class Model:
         l.log(f"Loading model at index {index}: '{model}'...")
 
         device = self.config.device
+        if device == cpu:
+            l.log("WARNING: device 'cpu' is not supported yet; the model is loaded on the GPU.")
         l.log(f"Scanning device '{device}'...")
 
         # --- Step 3: Check CUDA Availability ---
@@ -219,7 +223,14 @@ class Model:
         l.log(f"Loading model into {device} completed.")
 
         # --- Step 6: Record versions, model revision and GPUs ---
-        self._writeRunMetadata()
+        # If this fails (e.g. a corrupt metadata file), the caller gets no
+        # Model to close(), so release the engine here before re-raising.
+        try:
+            self._writeRunMetadata()
+        except Exception:
+            l.log("Writing the run metadata failed; releasing the loaded model.")
+            self.close()
+            raise
 
     @staticmethod
     def _resolveConfig(
@@ -280,12 +291,48 @@ class Model:
         :param message: A list of message strings to add. None or an empty
             list adds nothing.
         :return: Total number of active message histories.
-        :raises ValueError: If the number of messages neither is 1, nor
-            matches the number of histories, nor initializes empty histories.
-            Nothing is added in that case.
+        :raises TypeError: If `message` is a single string instead of a list.
+        :raises ValueError: If `role` is not systemRole, userRole or
+            modelRole; if the number of messages neither is 1, nor matches
+            the number of histories, nor initializes empty histories; or if
+            a history the messages would be added to ends with an empty
+            answer (see generate()). Nothing is added in these cases.
         """
+        l = Logger()
+
         if message is None:
             message = []
+
+        # A string is a sequence too: without this check, "hello" would be
+        # added as the five messages "h", "e", "l", "l", "o".
+        if isinstance(message, str):
+            l.log("addPrompt: message is a string, not a list of strings.")
+            raise TypeError("addPrompt: 'message' must be a list of strings, not a string.")
+
+        # Other roles (e.g. Gemini's "model") are not understood by the chat
+        # templates, by generate() or by the checkpoint, which would store
+        # them as user prompts.
+        if message and role not in chatRoles:
+            error = f"addPrompt: unknown role '{role}'; expected one of {list(chatRoles)}."
+            l.log(error)
+            raise ValueError(error)
+
+        # An empty answer (a thinking model cut off during its reasoning)
+        # must be generated again before the next turn: the checkpoint does
+        # not store empty answers, so a resumed run would see two prompts in
+        # a row and never answer the first one.
+        if message and self.messageHistories:
+            empty = [
+                idx for idx, history in enumerate(self.messageHistories)
+                if Model._endsWithEmptyAnswer(history)
+            ]
+            if empty:
+                error = (
+                    f"addPrompt: histories {empty} end with an empty answer; "
+                    f"call generate() again (with a larger max_tokens) first."
+                )
+                l.log(error)
+                raise ValueError(error)
 
         # Case 1: Broadcast a single prompt to every existing conversation
         # thread
@@ -321,10 +368,22 @@ class Model:
                 f"addPrompt: message count ({len(message)}) does not match "
                 f"active history count ({len(self.messageHistories)})."
             )
-            Logger().log(error)
+            l.log(error)
             raise ValueError(error)
 
         return len(self.messageHistories)
+
+    @staticmethod
+    def _endsWithEmptyAnswer(history: list[dict]) -> bool:
+        """
+        Returns whether `history` ends with an empty model answer, i.e. one
+        of a thinking model cut off during its reasoning.
+        """
+        return (
+            bool(history)
+            and history[-1].get(messageRoleElement) == modelRole
+            and not str(history[-1].get(messageTextElement) or "").strip()
+        )
 
     def addPromptFromFile(self, index: int, amount: int = -1) -> int:
         """
@@ -454,7 +513,9 @@ class Model:
         reasoning is stored under messageReasoningElement on the same
         message and is never sent back to the model. Answers cut off at
         config.max_tokens are listed in self.truncatedHistories; a thinking
-        model cut off during its reasoning gets an empty answer.
+        model cut off during its reasoning gets an empty answer, which the
+        next generate() call replaces by a new one (with the same seed and
+        settings, it is cut off again, so raise max_tokens first).
 
         A history whose prompt does not fit into config.max_model_len is
         skipped instead of failing its whole chunk: it keeps no answer, its
@@ -465,21 +526,37 @@ class Model:
         statistics of the call are added to the run metadata file.
 
         :return: Number of answers generated.
+        :raises RuntimeError: If there is something to generate but the
+            model was closed with close().
         """
         l = Logger()
         self.skippedHistories = []
         self.truncatedHistories = []
 
         # 1. Identify indices where the model has not yet generated a response
-        # (Histories whose last message role is NOT modelRole)
+        # (Histories whose last message role is NOT modelRole), or only an
+        # empty one
         unprocessed_indices = [
             idx for idx, history in enumerate(self.messageHistories)
-            if history and history[-1].get(messageRoleElement) != modelRole
+            if history and (
+                history[-1].get(messageRoleElement) != modelRole
+                or Model._endsWithEmptyAnswer(history)
+            )
         ]
 
         if not unprocessed_indices:
             l.log("No histories without an answer; nothing to generate.")
             return 0
+
+        if self.llm is None:
+            l.log("generate() called after close().")
+            raise RuntimeError("The model was closed with close(); create a new Model to generate.")
+
+        # Empty answers are replaced: remove them, so the prompt before them
+        # is answered again
+        for idx in unprocessed_indices:
+            if Model._endsWithEmptyAnswer(self.messageHistories[idx]):
+                self.messageHistories[idx].pop()
 
         tokenizer = self.llm.get_tokenizer()
         chunk_size = self.config.chunk_size
@@ -705,9 +782,12 @@ class Model:
 
         gpu_names = []
         for gpu_index in range(self.gpuCount):
+            # The metadata is still written without a name, but the reason
+            # is logged
             try:
                 gpu_names.append(torch.cuda.get_device_name(gpu_index))
-            except Exception:
+            except Exception as e:
+                Logger().log(f"Could not read the name of GPU {gpu_index}: {e!r}")
                 gpu_names.append(None)
 
         prompt_hashes = {
@@ -847,9 +927,11 @@ class Model:
         Reconstructs multi-turn conversation histories by mapping the
         "system" column and the prompt/answer column pairs back into
         role-message dictionaries, and restores the reasoning of answers
-        from the reasoning columns. Empty cells are skipped, so a history
-        whose last answer is missing (e.g. an answer cut off during the
-        reasoning) is generated again by generate().
+        from the reasoning columns. Empty answer cells are skipped, so a
+        history whose last answer is missing (e.g. an answer cut off during
+        the reasoning) is generated again by generate(). Empty prompts are
+        kept up to the last turn with text, and a row without any text
+        becomes an empty history, so every history keeps its index.
 
         The column names are derived from config.prompt_files (see
         _get_column_names()), so the checkpoint must be read with the same
@@ -921,41 +1003,60 @@ class Model:
 
             # Extract system prompt, which always opens the history
             system_val = row.get(systemColumn)
-            if pd.notna(system_val) and str(system_val).strip() != "":
+            if Model._hasText(system_val):
                 history.append({
                     messageRoleElement: systemRole,
                     messageTextElement: str(system_val)
                 })
 
-            for prompt_col, ans_col in column_pairs:
+            # Empty cells stand both for missing answers and for the turns
+            # a shorter history does not have. Prompts may be empty
+            # themselves, though (e.g. a template filled with ""), so every
+            # turn up to the last one with any text is restored with its
+            # prompt; skipping an empty prompt would leave its answer
+            # without a question.
+            last_turn = max(
+                (
+                    turn for turn, (prompt_col, ans_col) in enumerate(column_pairs)
+                    if Model._hasText(row.get(prompt_col)) or Model._hasText(row.get(ans_col))
+                ),
+                default=-1
+            )
+
+            for prompt_col, ans_col in column_pairs[:last_turn + 1]:
                 # Extract prompt text (User)
                 prompt_val = row.get(prompt_col)
-                if pd.notna(prompt_val) and str(prompt_val).strip() != "":
-                    history.append({
-                        messageRoleElement: userRole,
-                        messageTextElement: str(prompt_val)
-                    })
+                history.append({
+                    messageRoleElement: userRole,
+                    messageTextElement: str(prompt_val) if pd.notna(prompt_val) else ""
+                })
 
                 # Extract answer text (Model), with its reasoning if any
                 ans_val = row.get(ans_col)
-                if pd.notna(ans_val) and str(ans_val).strip() != "":
+                if Model._hasText(ans_val):
                     message = {
                         messageRoleElement: modelRole,
                         messageTextElement: str(ans_val).strip()
                     }
                     reasoning = row.get(prompt_col + reasoningColumnSuffix)
-                    if pd.notna(reasoning) and str(reasoning).strip() != "":
+                    if Model._hasText(reasoning):
                         message[messageReasoningElement] = str(reasoning)
                     history.append(message)
 
-            if history:
-                new_message_histories.append(history)
+            # Rows without any text are kept as empty histories, so the
+            # indices of all later histories stay the same
+            new_message_histories.append(history)
 
         # 4. Assign reconstructed histories back to model state
         self.messageHistories = new_message_histories
         l.log(f"Successfully imported {len(self.messageHistories)} message histories.")
 
         return len(self.messageHistories)
+
+    @staticmethod
+    def _hasText(value) -> bool:
+        """Returns whether a checkpoint cell holds more than whitespace."""
+        return pd.notna(value) and str(value).strip() != ""
 
     def toJSON(self, index: int) -> Optional[dict | list]:
         """
@@ -1058,16 +1159,25 @@ class Model:
         if hasattr(self, 'llm') and self.llm is not None:
             del self.llm
             self.llm = None
-            
-        # Wrap each destruction step to ensure one failure doesn't block 
-        # subsequent cleanup
-        with contextlib.suppress(Exception):
-            destroy_model_parallel()
-        with contextlib.suppress(Exception):
-            destroy_distributed_environment()
-        with contextlib.suppress(Exception):
-            torch.distributed.destroy_process_group()
-            
+
+        steps = [
+            ("destroy_model_parallel", destroy_model_parallel),
+            ("destroy_distributed_environment", destroy_distributed_environment),
+        ]
+        # The process group is usually gone after vLLM's own teardown, and
+        # destroying a missing one raises, so only try if one is left.
+        distributed = torch.distributed
+        if distributed.is_available() and distributed.is_initialized():
+            steps.append(("destroy_process_group", distributed.destroy_process_group))
+
+        # A failing step must not block the following ones, but is logged:
+        # it may leave GPU memory or processes behind.
+        for name, step in steps:
+            try:
+                step()
+            except Exception as e:
+                Logger().log(f"close(): {name} failed: {e!r}")
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

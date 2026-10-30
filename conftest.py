@@ -41,7 +41,11 @@ if not _is_installed("torch"):
         is_available=lambda: False,
         empty_cache=lambda: None,
     )
-    torch.distributed = types.SimpleNamespace(destroy_process_group=lambda: None)
+    torch.distributed = types.SimpleNamespace(
+        is_available=lambda: False,
+        is_initialized=lambda: False,
+        destroy_process_group=lambda: None,
+    )
     sys.modules["torch"] = torch
 
 if not _is_installed("vllm"):

@@ -20,6 +20,8 @@ import csv
 systemRole      = "system"
 userRole        = "user"
 modelRole       = "assistant"
+# Every role a message may have
+chatRoles       = (systemRole, userRole, modelRole)
 
 # ==============================================================================
 # Execution Device Identifiers
@@ -208,7 +210,8 @@ def modelRevision(model_id: str) -> Optional[str]:
     """
     Returns the Hugging Face commit hash of the locally cached snapshot of
     `model_id`, i.e. the exact model version vLLM loads. Returns None for a
-    local model directory, or if the snapshot cannot be found.
+    local model directory, or if the snapshot cannot be found; the latter is
+    logged, since the run metadata then lacks the model version.
     """
     if os.path.isdir(model_id):
         return None
@@ -219,7 +222,8 @@ def modelRevision(model_id: str) -> Optional[str]:
         snapshot = snapshot_download(model_id, local_files_only=True)
         # Cached snapshots live in .../snapshots/<commit hash>
         return os.path.basename(os.path.normpath(snapshot))
-    except Exception:
+    except Exception as e:
+        Logger().log(f"Could not determine the revision of model '{model_id}': {e!r}")
         return None
 
 

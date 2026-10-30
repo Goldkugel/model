@@ -18,7 +18,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 - **Errors raise exceptions** — invalid arguments, missing files and mismatched message counts raise an exception instead of returning an error code.
 - **Prompt logging** — write every message of every history to a semicolon-delimited log file.
 
-> **CPU is not supported yet.** `Model` requires at least one CUDA GPU and raises a `RuntimeError` otherwise. The `device` config field accepts `"cpu"`, but this currently has no effect.
+> **CPU is not supported yet.** `Model` requires at least one CUDA GPU and raises a `RuntimeError` otherwise. The `device` config field accepts `"cpu"`, but this currently has no effect apart from a warning in the log.
 
 ## Repository Structure
 
@@ -173,7 +173,7 @@ with Model("./config/config.yaml", index=0) as model:
     model.logPrompts()
 ```
 
-Messages can also be added directly. A single-item list is broadcast to every history; a list with one item per history is added one-to-one; on empty histories, one new history is created per item:
+Messages can also be added directly. A single-item list is broadcast to every history; a list with one item per history is added one-to-one; on empty histories, one new history is created per item. The role must be `"system"`, `"user"` or `"assistant"`, and `message` must be a list, even for a single message:
 
 ```python
 model.addPrompt(role="system", message=["You are a concise medical assistant."])
@@ -220,7 +220,7 @@ answer["reasoning"]   # the reasoning (key missing for non-thinking answers)
 
 **Settings.** For hybrid models such as Qwen3, `enable_thinking: false` switches thinking off and `true` switches it on; the setting is passed both to `LLM.chat()` and to the context-length check. Reasoning counts towards `max_tokens`, so thinking models need a much larger value (e.g. 8192–32768) and a `max_model_len` that fits prompt plus output. Most model cards also recommend `temperature: 0.6` and `top_p: 0.95` instead of near-greedy decoding, which tends to make the reasoning repeat itself.
 
-**Cut-off answers.** Every answer that stopped at `max_tokens` is listed in `model.truncatedHistories` and in the run metadata. A thinking model cut off during its reasoning gets an empty answer (`toJSON()` returns `None`); it is regenerated when the run is resumed from the checkpoint. With DeepSeek-R1-style templates, an output cut off before `</think>` contains no tag at all, so it is stored as the answer; it is still listed in `truncatedHistories`.
+**Cut-off answers.** Every answer that stopped at `max_tokens` is listed in `model.truncatedHistories` and in the run metadata. A thinking model cut off during its reasoning gets an empty answer (`toJSON()` returns `None`); the next `generate()` call, also after resuming from the checkpoint, replaces it by a new answer. With the same seed and settings the new answer is cut off again, so raise `max_tokens` first. Until then, `addPrompt()` refuses to add another turn to such a history, since the checkpoint cannot store the empty answer between two prompts. With DeepSeek-R1-style templates, an output cut off before `</think>` contains no tag at all, so it is stored as the answer; it is still listed in `truncatedHistories`.
 
 Models that use OpenAI's "harmony" format (gpt-oss) put their reasoning into a separate channel instead of `<think>` tags and are not supported yet.
 
@@ -246,14 +246,17 @@ All methods raise an exception on failure; none returns an error code:
 | Method | Raises |
 |---|---|
 | `Model()` | `FileNotFoundError` for a missing config file, `KeyError` if it has no `llm` section, `pydantic.ValidationError` for unknown keys or invalid values, `ValueError` for an invalid model index, `RuntimeError` if no CUDA device is visible |
-| `addPrompt()` | `ValueError` if the number of messages is neither 1, nor the number of histories, nor used to create new histories |
+| `addPrompt()` | `TypeError` if `message` is a string instead of a list; `ValueError` for an unknown role, if the number of messages is neither 1, nor the number of histories, nor used to create new histories, or if a history ends with an empty answer |
 | `addPromptFromFile()` | `IndexError` for an invalid prompt index, `FileNotFoundError` for a missing prompt file, `ValueError` if `prompt_folder` is empty or `amount` is missing for empty histories |
 | `formatPromptFromFile()` | `IndexError` for an invalid history index, `KeyError` for a placeholder without a value, `ValueError` for a malformed template (e.g. an unescaped `{`) |
 | `exportHistoriesToFile()` | `ValueError` if there are no histories |
 | `importHistoriesFromFile()` | `FileNotFoundError` if there is no checkpoint, `ValueError` if it is empty |
+| `generate()` | `RuntimeError` if the model was closed with `close()` |
 | `toJSON()` | `IndexError` for an invalid history index; returns `None` if the history has no answer or the answer contains no JSON |
 
 `generate()` returns the number of answers it generated.
+
+Failures that do not stop a run are written to the log instead: a cleanup step of `close()` that fails, a model revision or GPU name that cannot be read for the run metadata (stored as `null`), and `device: "cpu"`.
 
 ### Run metadata
 
@@ -272,12 +275,16 @@ All methods raise an exception on failure; none returns an error code:
 
 ### Changes in 2.1
 
-Version 2.1 is compatible with 2.0; existing code and configuration files keep working.
+Version 2.1 is compatible with 2.0: existing code and configuration files keep working, except calls that used to produce wrong histories silently and now raise an exception (see below).
 
 - `Model(config=...)` also accepts a dict or a `ModelConfig` instead of a file path.
 - Thinking models: the reasoning is stored apart from the answer, and answers cut off at `max_tokens` are listed in `truncatedHistories` (see [Thinking models](#thinking-models)). New, optional config options: `enable_thinking`, `reasoning_start_tag`, `reasoning_end_tag`.
 - Importing `model` no longer overwrites `CUDA_VISIBLE_DEVICES`, so the GPUs selected by Slurm or by hand are used.
 - `vllm` 0.9 or newer is required.
+- Input that used to produce wrong histories now raises: `addPrompt()` with a string instead of a list (`TypeError`), with an unknown role such as `"model"`, or after an empty answer (`ValueError`); `generate()` after `close()` (`RuntimeError`).
+- `generate()` also replaces empty answers (thinking models cut off during their reasoning), not only after resuming.
+- `importHistoriesFromFile()` keeps empty prompts and rows without text, so every history keeps its index.
+- Failures that were swallowed silently are logged (see [Errors](#errors)), and a model whose run metadata cannot be written is released before the error is raised.
 
 ### Migrating from 1.x
 

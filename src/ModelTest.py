@@ -84,6 +84,14 @@ def bare_model(model_config_data, tmp_path) -> Model:
     return model
 
 
+@pytest.fixture
+def logged(monkeypatch) -> list[str]:
+    """Records every message passed to Logger.log() during the test."""
+    messages = []
+    monkeypatch.setattr(Logger, "log", lambda self, message, *args, **kwargs: messages.append(message))
+    return messages
+
+
 class FakeTokenizer:
     """
     Chat-template stand-in: one token per character of every message.
@@ -429,6 +437,29 @@ class TestModelConstructorGuards:
 
         assert captured["llm"]["enable_expert_parallel"] is expected
 
+    def test_warns_that_cpu_is_not_supported(self, tmp_path, model_config_data, monkeypatch, logged):
+        model_config_data.update({"metadata_folder": str(tmp_path / "logs"), "device": "cpu"})
+        _fake_engine(monkeypatch)
+
+        Model(config=model_config_data)
+
+        assert any("'cpu' is not supported" in message for message in logged)
+
+    def test_releases_the_engine_if_the_run_metadata_cannot_be_written(
+        self, tmp_path, model_config_data, monkeypatch
+    ):
+        # The caller gets no Model to close(), so __init__ must do it
+        (tmp_path / "run_metadata.json").write_text("{broken", encoding="utf-8")
+        model_config_data["metadata_folder"] = str(tmp_path)
+        _fake_engine(monkeypatch)
+        closed = []
+        monkeypatch.setattr(Model, "close", lambda self: closed.append(self.llm))
+
+        with pytest.raises(json.JSONDecodeError):
+            Model(config=model_config_data)
+
+        assert len(closed) == 1 and closed[0] is not None
+
     def test_import_keeps_the_gpu_selection(self, monkeypatch):
         # A selection such as Slurm's must survive importing the module;
         # it used to be reset to "0,...,n-1".
@@ -486,6 +517,30 @@ class TestAddPrompt:
 
         assert count == 0
         assert bare_model.messageHistories == []
+
+
+class TestAddPromptValidation:
+
+    def test_a_string_instead_of_a_list_raises(self, bare_model):
+        # It used to be split into one history per character
+        with pytest.raises(TypeError):
+            bare_model.addPrompt(userRole, "hello")
+        assert bare_model.messageHistories == []
+
+    def test_an_unknown_role_raises(self, bare_model):
+        bare_model.addPrompt(userRole, ["q"])
+
+        with pytest.raises(ValueError, match="unknown role 'model'"):
+            bare_model.addPrompt("model", ["a"])
+        assert len(bare_model.messageHistories[0]) == 1
+
+    def test_a_turn_after_an_empty_answer_raises(self, bare_model):
+        bare_model.addPrompt(userRole, ["q1", "q2"])
+        bare_model.addPrompt(modelRole, ["a1", ""])
+
+        with pytest.raises(ValueError, match=r"histories \[1\] end with an empty answer"):
+            bare_model.addPrompt(userRole, ["follow-up"])
+        assert [len(history) for history in bare_model.messageHistories] == [2, 2]
 
 
 # --- Model.addPromptFromFile ----------------------------------------------------
@@ -724,6 +779,30 @@ class TestExportImportHistoriesRoundTrip:
 
         assert bare_model.messageHistories == expected
 
+    def test_round_trip_keeps_empty_prompts_and_history_indices(self, tmp_path, bare_model):
+        # An empty prompt used to be dropped, leaving its answer without a
+        # question, and a row without text used to be dropped entirely
+        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
+        bare_model.messageHistories = [
+            [
+                {messageRoleElement: userRole, messageTextElement: "  "},
+                {messageRoleElement: modelRole, messageTextElement: "a1"},
+            ],
+            [],
+            [
+                {messageRoleElement: userRole, messageTextElement: "q"},
+                {messageRoleElement: modelRole, messageTextElement: "a3"},
+            ],
+        ]
+        expected = [list(history) for history in bare_model.messageHistories]
+
+        bare_model.exportHistoriesToFile()
+        bare_model.messageHistories = []
+        bare_model.importHistoriesFromFile()
+
+        assert bare_model.messageHistories == expected
+        assert bare_model.toJSON(1) is None
+
     def test_import_without_prompt_columns_raises(self, tmp_path, bare_model):
         # E.g. a checkpoint written with other prompt_files
         bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
@@ -926,6 +1005,30 @@ class TestGenerateResumeAndTurns:
         assert [message[messageTextElement] for message in sent[0]] == ["first", "answer to first", "second"]
         assert bare_model.messageHistories[0][-1][messageTextElement] == "answer to second"
 
+    def test_empty_answer_is_generated_again(self, bare_model):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["long question", "short"])
+        bare_model.generate()
+        assert bare_model.messageHistories[0][-1][messageTextElement] == ""
+
+        # E.g. after raising max_tokens: only the empty answer is replaced
+        bare_model.llm = FakeLLM()
+        assert bare_model.generate() == 1
+
+        assert bare_model.messageHistories[0] == [
+            {messageRoleElement: userRole, messageTextElement: "long question"},
+            {messageRoleElement: modelRole, messageTextElement: "answer to long question"},
+        ]
+        assert len(bare_model.messageHistories[1]) == 2
+
+    def test_generate_after_close_raises_a_clear_error(self, bare_model):
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            bare_model.generate()
+        assert len(bare_model.messageHistories[0]) == 1
+
     def test_context_check_accepts_a_batch_encoding(self, bare_model):
         bare_model.llm = FakeLLM()
         bare_model.llm.tokenizer = BatchEncodingTokenizer()
@@ -1106,6 +1209,18 @@ class TestRunMetadata:
         assert run["packages"]["model"] is not None
         assert run["model"] == {"id": "dummy/model-a", "index": 0, "revision": None}
 
+    def test_unreadable_gpu_name_is_null_and_logged(self, bare_model, monkeypatch, logged):
+        def broken(index):
+            raise RuntimeError("NVML not available")
+        monkeypatch.setattr(torch.cuda, "get_device_name", broken, raising=False)
+        bare_model.gpuCount = 1
+
+        bare_model._writeRunMetadata()
+
+        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        assert json.loads(open(path, encoding="utf-8").read())[0]["gpus"]["names"] == [None]
+        assert any("name of GPU 0" in message for message in logged)
+
     def test_keeps_other_runs_and_replaces_its_own(self, bare_model):
         path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
         os.makedirs(bare_model.config.metadata_folder)
@@ -1185,6 +1300,8 @@ class TestClose:
         monkeypatch.setattr(model_module, "destroy_model_parallel", step("parallel"))
         monkeypatch.setattr(model_module, "destroy_distributed_environment", step("env"))
         monkeypatch.setattr(torch.distributed, "destroy_process_group", step("group"))
+        monkeypatch.setattr(torch.distributed, "is_available", lambda: True, raising=False)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True, raising=False)
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "empty_cache", step("cache"), raising=False)
         return calls
@@ -1198,12 +1315,25 @@ class TestClose:
         assert bare_model.llm is None
         assert calls == ["parallel", "env", "group", "cache"]
 
-    def test_close_continues_after_a_failing_cleanup_step(self, bare_model, monkeypatch):
+    def test_close_continues_after_a_failing_cleanup_step_and_logs_it(
+        self, bare_model, monkeypatch, logged
+    ):
         calls = self._record_cleanup(monkeypatch, failing="parallel")
 
         bare_model.close()
 
         assert calls == ["parallel", "env", "group", "cache"]
+        assert any("destroy_model_parallel failed" in message for message in logged)
+
+    def test_close_skips_a_process_group_that_does_not_exist(self, bare_model, monkeypatch, logged):
+        # Destroying a missing process group raises; it must not be tried
+        calls = self._record_cleanup(monkeypatch)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False, raising=False)
+
+        bare_model.close()
+
+        assert calls == ["parallel", "env", "cache"]
+        assert not any("failed" in message for message in logged)
 
 
 # --- ModelUtils.writePrompt ---------------------------------------------------------
@@ -1270,7 +1400,7 @@ class TestModelUtils:
 
         assert modelRevision("org/name") == "abc123"
 
-    def test_model_revision_without_a_cached_snapshot_is_none(self, monkeypatch):
+    def test_model_revision_without_a_cached_snapshot_is_none_and_logged(self, monkeypatch, logged):
         def not_cached(model_id, local_files_only):
             raise FileNotFoundError(model_id)
         hub = types.ModuleType("huggingface_hub")
@@ -1278,6 +1408,7 @@ class TestModelUtils:
         monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
 
         assert modelRevision("org/name") is None
+        assert any("revision of model 'org/name'" in message for message in logged)
 
 
 # --- Package exports -------------------------------------------------------------------
