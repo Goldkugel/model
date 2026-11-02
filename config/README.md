@@ -11,38 +11,7 @@ When `model` is used inside a larger pipeline, the pipeline's config file may co
 
 ## `llm` section
 
-```yaml
-llm:
-  model_id:
-    - "google/medgemma-4b-it"
-  device: "cuda"
-  expert_parallel_models:
-    - "Qwen3-30B"
-  seed: 2898231092
-  temperature: 0.01
-  top_p: 0.95
-  max_model_len: 8192
-  max_num_batched_tokens: 16384
-  enforce_eager: true
-  gpu_memory_utilization: 0.9
-  dtype: "auto"
-  quantization: null
-  enable_prefix_caching: true
-  enable_thinking: null
-  reasoning_start_tag: "<think>"
-  reasoning_end_tag: "</think>"
-  max_tokens: 2048
-  chunk_size: 500
-  prompt_tmp_folder: "./data/tmp/"
-  prompt_tmp_file: "prompts_raw.tmp"
-  prompt_log_folder: "./data/logs/"
-  prompt_log_file: "prompts.log"
-  metadata_folder: "./data/logs/"
-  metadata_file: "run_metadata.json"
-  prompt_folder: "./prompts/"
-  prompt_files:
-    - "mapping.md"
-```
+See [`config.yaml`](./config.yaml) for the settings in use.
 
 Every field is optional and falls back to its default. Unknown fields are rejected, so a typo raises a validation error instead of being ignored silently. See the [field reference](../README.md#configuration) in the main README for the meaning, type and default of every field.
 

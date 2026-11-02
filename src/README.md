@@ -1,15 +1,14 @@
 # Source
 
-The source code of the `model` package (installed from this folder, see `pyproject.toml`).
+The source code of the `model` package, in `model/` (installed from this folder, see `pyproject.toml`).
 
-| File | Content |
+| File in `model/` | Content |
 |---|---|
 | `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `messageReasoningElement`, `messageTruncatedElement`, `gpu`, `cpu` |
 | `Model.py` | `Model` class: loads a model into vLLM (configured from a YAML file, a dict or a `ModelConfig`), manages the conversation histories, fills prompt templates, generates answers in chunks (skipping prompts longer than the context, splitting off the reasoning of thinking models, logging progress), writes and reads checkpoints, writes the run metadata, parses JSON answers and frees GPU memory |
 | `ModelConfig.py` | `ModelConfig`, the pydantic schema of the `llm` config section |
-| `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log, atomic writers for checkpoints (`writeCheckpointCSV()`) and JSON (`writeJSON()`), and helpers for the run metadata (package versions, model revision, file hashes) |
-| `ModelTest.py` | Pytest suite, plus a GPU diagnostic when run as a script |
-| `runTest.sh` | Slurm job running the GPU diagnostic |
+| `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log, atomic writers for checkpoints (`writeCheckpointCSV()`) and JSON (`writeJSON()`), the locked run metadata update (`updateRunRecord()`), and helpers for the run metadata (package versions, model revision, file hashes) |
+| `diagnostic.py` | GPU diagnostic, run with `python -m model.diagnostic [index]` (see [`scripts/`](../scripts/README.md)) |
 
 ## Import side effects
 
@@ -40,14 +39,4 @@ An answer of a thinking model also has a `"reasoning"` key (`messageReasoningEle
 
 ## Tests
 
-```bash
-pytest -v
-```
-
-Run the tests from the repository root; `pytest` collects every `*Test.py` file in this folder. They need neither a GPU nor a downloaded model, and `vllm` and `torch` need not be installed (see `conftest.py` in the repository root). To check the GPU setup on the cluster, submit the diagnostic from this folder (it changes to the project root itself). It loads a configured model and generates two short answers; the optional argument is the index of the model in `model_id` (default 0):
-
-```bash
-sbatch runTest.sh
-```
-
-Its output is written to `data/slurmlogs/`; the checkpoint and run metadata of its test generation go to a temporary folder, whose path it prints.
+The tests are in [`tests/`](../tests/README.md); the Slurm job for the GPU diagnostic is in [`scripts/`](../scripts/README.md).

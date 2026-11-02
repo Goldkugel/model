@@ -1,6 +1,6 @@
 # Slurm Logs
 
-Output of the Slurm jobs in [`src/`](../../src/), e.g. `runTest.sh`:
+Output of the Slurm jobs in [`scripts/`](../../scripts/), e.g. `runTest.sh`:
 
 | File | Content |
 |---|---|

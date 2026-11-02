@@ -1,11 +1,10 @@
 # Runs the Model test suite on every push and pull request.
 #
 # vllm and torch are not installed: they are several GB in size, need a GPU
-# to be of any use, and the tests do not use them (conftest.py registers
-# stand-ins). The package is therefore installed without its dependencies,
-# and the remaining runtime dependencies are installed explicitly.
-# Tests are run from the repository root because the logger reads
-# ./config/config.yaml.
+# to be of any use, and the tests do not use them (tests/conftest.py
+# registers stand-ins). The package is therefore installed without its
+# dependencies, and the remaining runtime dependencies are installed
+# explicitly.
 
 name: Tests
 
@@ -44,7 +43,7 @@ jobs:
             "logger @ git+https://github.com/Goldkugel/logger.git@v1.1.0" \
             pandas "pydantic>=2" pyyaml pytest
 
-      # Runs every *Test.py file in src/ (see [tool.pytest.ini_options] in
+      # Runs every *Test.py file in tests/ (see [tool.pytest.ini_options] in
       # pyproject.toml), including the GPU diagnostic with vLLM replaced.
       - name: Run tests
         run: python -m pytest -v

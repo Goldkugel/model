@@ -1,8 +1,5 @@
 import sys
 
-# Prevent Python bytecode caching
-sys.dont_write_bytecode = True
-
 import importlib
 import json
 import multiprocessing
@@ -26,6 +23,8 @@ from model.ModelUtils import (
     updateRunRecord, writeCheckpointCSV, messageTruncatedElement,
 )
 import model.ModelUtils as model_utils
+from model.diagnostic import main
+from conftest import REPO_ROOT
 
 # The Model module itself (not the class re-exported as `model.Model`), for
 # monkeypatching names it imported from vllm.
@@ -94,6 +93,25 @@ def logged(monkeypatch) -> list[str]:
     messages = []
     monkeypatch.setattr(Logger, "log", lambda self, message, *args, **kwargs: messages.append(message))
     return messages
+
+
+def _checkpoint_path(model: Model) -> pathlib.Path:
+    """Path of the checkpoint file of `model`."""
+    return pathlib.Path(model.config.prompt_tmp_folder) / model.config.prompt_tmp_file
+
+
+def _metadata_path(model: Model) -> str:
+    """Path of the run metadata file of `model`."""
+    return os.path.join(model.config.metadata_folder, model.config.metadata_file)
+
+
+def _assert_round_trip(model: Model) -> None:
+    """Writes the histories to the checkpoint, reads them back and checks that nothing changed."""
+    expected = [list(history) for history in model.messageHistories]
+    model.exportHistoriesToFile()
+    model.messageHistories = []
+    model.importHistoriesFromFile()
+    assert model.messageHistories == expected
 
 
 class FakeTokenizer:
@@ -223,7 +241,7 @@ class TestModelConfig:
             ModelConfig(gpu_memory_utilization=1.5)
 
     def test_repository_config_contains_every_option(self):
-        with open("./config/config.yaml", encoding="utf-8") as f:
+        with open(REPO_ROOT / "config" / "config.yaml", encoding="utf-8") as f:
             llm_section = yaml.safe_load(f)["llm"]
         assert set(llm_section) == set(ModelConfig.model_fields)
 
@@ -676,9 +694,6 @@ class TestGetColumnNames:
 class TestExportImportHistoriesRoundTrip:
 
     def test_round_trip_preserves_prompt_and_answer_pairs(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
-        bare_model.config.prompt_tmp_file = "raw.tmp"
-        bare_model.config.prompt_files = ["prompt_a.md"]
 
         bare_model.addPrompt(userRole, ["What is the capital of France?"])
         bare_model.addPrompt(modelRole, ["Paris"])
@@ -696,36 +711,19 @@ class TestExportImportHistoriesRoundTrip:
         ]
 
     def test_round_trip_keeps_answers_that_look_like_missing_or_numbers(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
-        bare_model.config.prompt_files = ["prompt_a.md"]
 
         bare_model.addPrompt(userRole, ["q1", "q2", "q3"])
         bare_model.addPrompt(modelRole, ["NA", "None", "1"])
-        expected = [list(history) for history in bare_model.messageHistories]
-
-        bare_model.exportHistoriesToFile()
-        bare_model.messageHistories = []
-        bare_model.importHistoriesFromFile()
-
-        assert bare_model.messageHistories == expected
+        _assert_round_trip(bare_model)
 
     def test_round_trip_preserves_system_role(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
-        bare_model.config.prompt_files = ["prompt_a.md"]
 
         bare_model.addPrompt(systemRole, ["You are concise."])
         bare_model.addPrompt(userRole, ["Question"])
         bare_model.addPrompt(modelRole, ["Answer"])
-        expected = [list(history) for history in bare_model.messageHistories]
-
-        bare_model.exportHistoriesToFile()
-        bare_model.messageHistories = []
-        bare_model.importHistoriesFromFile()
-
-        assert bare_model.messageHistories == expected
+        _assert_round_trip(bare_model)
 
     def test_round_trip_with_non_identifier_prompt_file_name(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
         bare_model.config.prompt_files = ["01_hpo-mapping.md"]
 
         bare_model.addPrompt(userRole, ["Question"])
@@ -739,36 +737,30 @@ class TestExportImportHistoriesRoundTrip:
         assert bare_model.messageHistories == expected
 
     def test_export_leaves_no_temporary_file(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
-        bare_model.config.prompt_tmp_file = "raw.tmp"
 
         bare_model.addPrompt(userRole, ["Question"])
         bare_model.exportHistoriesToFile()
 
-        assert sorted(os.listdir(tmp_path)) == ["raw.tmp"]
+        assert os.listdir(_checkpoint_path(bare_model).parent) == ["raw.tmp"]
 
     def test_export_with_no_histories_raises(self, bare_model):
         with pytest.raises(ValueError):
             bare_model.exportHistoriesToFile()
 
     def test_import_with_missing_file_raises(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
-        bare_model.config.prompt_tmp_file = "does_not_exist.tmp"
 
         with pytest.raises(FileNotFoundError):
             bare_model.importHistoriesFromFile()
 
     def test_import_with_empty_file_raises(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
-        bare_model.config.prompt_tmp_file = "empty.tmp"
-        (tmp_path / "empty.tmp").write_text("", encoding="utf-8")
+        _checkpoint_path(bare_model).parent.mkdir()
+        _checkpoint_path(bare_model).write_text("", encoding="utf-8")
 
         with pytest.raises(ValueError):
             bare_model.importHistoriesFromFile()
 
 
     def test_round_trip_of_multi_turn_histories_of_different_lengths(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
         bare_model.messageHistories = [
             [
                 {messageRoleElement: userRole, messageTextElement: "q1"},
@@ -784,7 +776,7 @@ class TestExportImportHistoriesRoundTrip:
         expected = [list(history) for history in bare_model.messageHistories]
 
         bare_model.exportHistoriesToFile()
-        header = (tmp_path / "raw.tmp").read_text(encoding="utf-8").splitlines()[0]
+        header = _checkpoint_path(bare_model).read_text(encoding="utf-8").splitlines()[0]
         assert header == '"_model";"prompt_a";"prompt_a_answer";"prompt_b";"prompt_b_answer"'
 
         bare_model.messageHistories = []
@@ -793,21 +785,13 @@ class TestExportImportHistoriesRoundTrip:
         assert bare_model.messageHistories == expected
 
     def test_consecutive_user_prompts_get_their_own_columns(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
         bare_model.addPrompt(userRole, ["first"])
         bare_model.addPrompt(userRole, ["second"])
-        expected = [list(history) for history in bare_model.messageHistories]
-
-        bare_model.exportHistoriesToFile()
-        bare_model.messageHistories = []
-        bare_model.importHistoriesFromFile()
-
-        assert bare_model.messageHistories == expected
+        _assert_round_trip(bare_model)
 
     def test_round_trip_keeps_empty_prompts_and_history_indices(self, tmp_path, bare_model):
         # An empty prompt used to be dropped, leaving its answer without a
         # question, and a row without text used to be dropped entirely
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
         bare_model.messageHistories = [
             [
                 {messageRoleElement: userRole, messageTextElement: "  "},
@@ -819,19 +803,13 @@ class TestExportImportHistoriesRoundTrip:
                 {messageRoleElement: modelRole, messageTextElement: "a3"},
             ],
         ]
-        expected = [list(history) for history in bare_model.messageHistories]
-
-        bare_model.exportHistoriesToFile()
-        bare_model.messageHistories = []
-        bare_model.importHistoriesFromFile()
-
-        assert bare_model.messageHistories == expected
+        _assert_round_trip(bare_model)
         assert bare_model.toJSON(1) is None
 
     def test_import_without_prompt_columns_raises(self, tmp_path, bare_model):
         # E.g. a checkpoint written with other prompt_files
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
-        (tmp_path / "raw.tmp").write_text('"other";"other_answer"\n"q";"a"\n', encoding="utf-8")
+        _checkpoint_path(bare_model).parent.mkdir()
+        _checkpoint_path(bare_model).write_text('"other";"other_answer"\n"q";"a"\n', encoding="utf-8")
 
         with pytest.raises(ValueError, match="no prompt/answer columns"):
             bare_model.importHistoriesFromFile()
@@ -940,7 +918,7 @@ class TestGenerate:
         assert bare_model.messageHistories[0][-1] == {messageRoleElement: modelRole, messageTextElement: "answer to a"}
         assert bare_model.messageHistories[1][-1][messageTextElement] == "done"
         assert all(history[-1][messageRoleElement] == modelRole for history in bare_model.messageHistories)
-        assert os.path.isfile(os.path.join(bare_model.config.prompt_tmp_folder, bare_model.config.prompt_tmp_file))
+        assert os.path.isfile(_checkpoint_path(bare_model))
 
     def test_skips_prompts_longer_than_the_context(self, bare_model):
         bare_model.llm = FakeLLM()
@@ -969,7 +947,7 @@ class TestGenerate:
 
         bare_model.generate()
 
-        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        path = _metadata_path(bare_model)
         runs = json.loads(open(path, encoding="utf-8").read())
         stats = runs[0]["generations"][0]
         assert stats["histories"] == 3
@@ -1105,7 +1083,7 @@ class TestConcurrentRuns:
     def test_export_detects_a_checkpoint_changed_by_another_run(self, bare_model):
         bare_model.addPrompt(userRole, ["q"])
         bare_model.exportHistoriesToFile()
-        path = os.path.join(bare_model.config.prompt_tmp_folder, bare_model.config.prompt_tmp_file)
+        path = str(_checkpoint_path(bare_model))
         writeCheckpointCSV(model_module.pd.DataFrame([{"_model": "other", "prompt_a": "x"}]), path)
 
         with pytest.raises(RuntimeError, match="was changed by another run"):
@@ -1132,7 +1110,7 @@ class TestConcurrentRuns:
 
     def test_a_checkpoint_without_model_column_is_accepted(self, bare_model):
         # Written by a version before the "_model" column
-        path = os.path.join(bare_model.config.prompt_tmp_folder, bare_model.config.prompt_tmp_file)
+        path = str(_checkpoint_path(bare_model))
         writeCheckpointCSV(model_module.pd.DataFrame([{"prompt_a": "q", "prompt_a_answer": "a"}]), path)
 
         assert bare_model.importHistoriesFromFile() == 1
@@ -1322,7 +1300,7 @@ class TestGenerateWithThinkingModels:
 
         bare_model.generate()
 
-        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        path = _metadata_path(bare_model)
         stats = json.loads(open(path, encoding="utf-8").read())[0]["generations"][0]
         assert stats["truncated"] == [1]
         # FakeTokenizer.encode: one token per character of both reasonings
@@ -1332,7 +1310,6 @@ class TestGenerateWithThinkingModels:
         )
 
     def test_checkpoint_round_trip_keeps_reasoning(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
         bare_model.config.prompt_files = ["prompt_a.md"]
         bare_model.llm = FakeThinkingLLM()
         bare_model.addPrompt(userRole, ["q1", "q2"])
@@ -1340,7 +1317,7 @@ class TestGenerateWithThinkingModels:
         expected = [list(history) for history in bare_model.messageHistories]
 
         bare_model.exportHistoriesToFile()
-        header = open(os.path.join(tmp_path, bare_model.config.prompt_tmp_file), encoding="utf-8").readline()
+        header = open(_checkpoint_path(bare_model), encoding="utf-8").readline()
         assert "prompt_a_reasoning" in header
 
         bare_model.messageHistories = []
@@ -1348,14 +1325,13 @@ class TestGenerateWithThinkingModels:
         assert bare_model.messageHistories == expected
 
     def test_checkpoint_without_reasoning_has_no_reasoning_column(self, tmp_path, bare_model):
-        bare_model.config.prompt_tmp_folder = str(tmp_path) + os.sep
         bare_model.config.prompt_files = ["prompt_a.md"]
         bare_model.addPrompt(userRole, ["q1"])
         bare_model.addPrompt(modelRole, ["a1"])
 
         bare_model.exportHistoriesToFile()
 
-        header = open(os.path.join(tmp_path, bare_model.config.prompt_tmp_file), encoding="utf-8").readline()
+        header = open(_checkpoint_path(bare_model), encoding="utf-8").readline()
         assert "reasoning" not in header
 
 
@@ -1370,7 +1346,7 @@ class TestRunMetadata:
 
         bare_model._writeRunMetadata()
 
-        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        path = _metadata_path(bare_model)
         run = json.loads(open(path, encoding="utf-8").read())[0]
         assert run["prompt_files"] == {
             # sha256("Hello")
@@ -1388,12 +1364,12 @@ class TestRunMetadata:
 
         bare_model._writeRunMetadata()
 
-        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        path = _metadata_path(bare_model)
         assert json.loads(open(path, encoding="utf-8").read())[0]["gpus"]["names"] == [None]
         assert any("name of GPU 0" in message for message in logged)
 
     def test_keeps_other_runs_and_replaces_its_own(self, bare_model):
-        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        path = _metadata_path(bare_model)
         os.makedirs(bare_model.config.metadata_folder)
         with open(path, "w", encoding="utf-8") as f:
             json.dump([{"run_id": "earlier-run"}], f)
@@ -1405,7 +1381,7 @@ class TestRunMetadata:
         assert [run["run_id"] for run in runs] == ["earlier-run", "test-run"]
 
     def test_rejects_a_file_that_is_not_a_list(self, bare_model):
-        path = os.path.join(bare_model.config.metadata_folder, bare_model.config.metadata_file)
+        path = _metadata_path(bare_model)
         os.makedirs(bare_model.config.metadata_folder)
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"run_id": "x"}, f)
@@ -1610,14 +1586,15 @@ class DiagnosticLLM(FakeLLM):
 
 class TestGpuDiagnostic:
     """
-    Runs main() with vLLM and the GPU replaced, so the diagnostic submitted
-    by runTest.sh cannot break unnoticed. It reads ./config/config.yaml,
-    like the other tests run from the repository root.
+    Runs model.diagnostic.main() with vLLM and the GPU replaced, so the
+    diagnostic submitted by scripts/runTest.sh cannot break unnoticed. It
+    reads ./config/config.yaml, so it runs in the repository root.
     """
 
     @pytest.fixture
     def diagnostic(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sys, "argv", ["ModelTest.py"])
+        monkeypatch.chdir(REPO_ROOT)
+        monkeypatch.setattr(sys, "argv", ["diagnostic"])
         monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(tmp_path))
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
@@ -1651,106 +1628,3 @@ class TestGpuDiagnostic:
             main()
 
         assert exit_info.value.code == 1
-
-
-# ==============================================================================
-# Manual Slurm/GPU diagnostic (not a pytest test) -- see src/runTest.sh.
-# Run directly with `python3 src/ModelTest.py [index]` on a GPU node, from the
-# repository root; `index` selects the model in config.model_id (default 0).
-# ==============================================================================
-
-# Prompts of the smoke test: the first checks toJSON(), the second a free answer
-diagnostic_prompts = [
-    'Reply with only this JSON object and nothing else: {"answer": 4}',
-    "Name one symptom of microcephaly in one sentence.",
-]
-
-
-def main():
-    index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-
-    print("=" * 50)
-    print("SLURM & GPU ENVIRONMENT DIAGNOSTIC")
-    print("=" * 50)
-
-    # 1. Check Slurm & CUDA visibility
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "Not Set")
-    print(f"CUDA_VISIBLE_DEVICES : {cuda_visible}")
-
-    cuda_available = torch.cuda.is_available()
-    print(f"PyTorch CUDA Available: {cuda_available}")
-
-    if not cuda_available:
-        print("\n❌ ERROR: CUDA is not available to PyTorch.")
-        print("Check if the CUDA module is loaded or if PyTorch CPU-only is installed.")
-        sys.exit(1)
-
-    device_count = torch.cuda.device_count()
-    device_name = torch.cuda.get_device_name(0)
-    print(f"GPU Device Count     : {device_count}")
-    print(f"Active GPU           : {device_name}")
-
-    print("\n" + "=" * 50)
-    print("INITIALIZING MODEL")
-    print("=" * 50)
-
-    # 2. Load the selected model into vLLM. The checkpoint and run metadata
-    # of the test generation go to a temporary folder, so the checkpoint of
-    # a real run is never overwritten.
-    with open("./config/config.yaml", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    output_dir = tempfile.mkdtemp(prefix="modeltest_")
-    config["llm"]["prompt_tmp_folder"] = output_dir
-    config["llm"]["metadata_folder"] = output_dir
-
-    try:
-        model = Model(config, index=index)
-        print(f"✅ Model '{model.model}' successfully initialized.")
-    except Exception as e:
-        print(f"\n❌ ERROR initializing Model: {e}")
-        sys.exit(1)
-
-    print("\n" + "=" * 50)
-    print("GENERATING")
-    print("=" * 50)
-    print(f"enable_thinking      : {model.config.enable_thinking}")
-    print(f"Output folder        : {output_dir}")
-
-    # 3. Generate an answer for every diagnostic prompt
-    errors = []
-    try:
-        model.addPrompt(userRole, diagnostic_prompts)
-        generated = model.generate()
-
-        for idx, history in enumerate(model.getMessageHistories()):
-            message = history[-1]
-            print(f"\n--- History {idx} ---")
-            print(f"Prompt   : {history[0][messageTextElement]}")
-            print(f"Reasoning: {len(message.get(messageReasoningElement, ''))} characters")
-            print(f"Answer   : {message.get(messageTextElement, '') if message[messageRoleElement] == modelRole else '(none)'}")
-
-        if generated != len(diagnostic_prompts):
-            errors.append(f"{generated} of {len(diagnostic_prompts)} answers generated.")
-        if model.skippedHistories:
-            errors.append(f"Histories {model.skippedHistories} exceed max_model_len.")
-        if model.truncatedHistories:
-            errors.append(f"Histories {model.truncatedHistories} were cut off at max_tokens "
-                          f"({model.config.max_tokens}); increase max_tokens for thinking models.")
-        if model.toJSON(0) != {"answer": 4}:
-            print("\n⚠️  WARNING: toJSON() did not return {\"answer\": 4} for history 0.")
-    except Exception as e:
-        errors.append(f"Generation failed: {e!r}")
-    finally:
-        # 4. Free GPU memory and shut down vLLM's distributed environment
-        model.close()
-
-    if errors:
-        for error in errors:
-            print(f"\n❌ ERROR: {error}")
-        sys.exit(1)
-
-    print("\n🎉 ALL CHECKS PASSED SUCCESSFULLY!")
-
-
-if __name__ == "__main__":
-    main()

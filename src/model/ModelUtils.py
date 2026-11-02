@@ -1,8 +1,3 @@
-import sys
-# Prevent Python from writing .pyc bytecode cache files to keep container 
-# environments clean
-sys.dont_write_bytecode = True
-
 from importlib  import metadata
 from typing     import Optional
 from logger     import Logger
@@ -79,6 +74,13 @@ modelColumn = "_model"
 # Logging Utilities
 # ==============================================================================
 
+def _makeParentFolder(path: str) -> None:
+    """Creates the folder of the file at `path` if it does not exist yet."""
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
+
+
 def writePrompt(path: str, histories: list[list[dict]]) -> int:
     """
     Writes prompt and response histories to a semicolon-delimited log file,
@@ -97,10 +99,7 @@ def writePrompt(path: str, histories: list[list[dict]]) -> int:
     file_name = os.path.basename(path)
     l.log(f"Logging prompts in '{file_name}'...")
 
-    # Ensure output parent directories exist before writing
-    parent_dir = os.path.dirname(path)
-    if parent_dir and not os.path.exists(parent_dir):
-        os.makedirs(parent_dir, exist_ok=True)
+    _makeParentFolder(path)
 
     with open(path, mode="w", encoding="utf-8") as prompt_log_file:
         # Write CSV header row
@@ -143,10 +142,7 @@ def _writeAtomically(path: str, write) -> None:
     :param path: Destination file path.
     :param write: Function writing the complete file to the path it is given.
     """
-    # Ensure output parent directories exist before writing
-    parent_dir = os.path.dirname(path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
+    _makeParentFolder(path)
 
     # Next to the target, so os.replace() stays within one file system
     tmp_path = path + ".tmp"
@@ -210,9 +206,7 @@ def lockedFile(path: str):
 
     :param path: Path of the file the lock protects.
     """
-    parent_dir = os.path.dirname(path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
+    _makeParentFolder(path)
 
     lock_path = path + ".lock"
     with open(lock_path, mode="a", encoding="utf-8") as handle:

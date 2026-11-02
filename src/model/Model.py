@@ -1,7 +1,3 @@
-import sys
-# Prevent Python from writing .pyc bytecode cache files to keep container environments clean
-sys.dont_write_bytecode = True
-
 from typing             import Optional
 from vllm               import LLM, SamplingParams
 from vllm.distributed   import destroy_distributed_environment, destroy_model_parallel
@@ -396,6 +392,21 @@ class Model:
 
         return len(self.messageHistories)
 
+    def _history(self, index: int) -> list[dict]:
+        """
+        Returns the history at `index`.
+
+        :raises IndexError: If `index` is out of range for messageHistories
+            (negative indices included, unlike plain list indexing).
+        """
+        if not (0 <= index < len(self.messageHistories)):
+            Logger().log(f"History index {index} out of bounds.")
+            raise IndexError(
+                f"History index {index} out of range "
+                f"({len(self.messageHistories)} histories)."
+            )
+        return self.messageHistories[index]
+
     @staticmethod
     def _endsWithEmptyAnswer(history: list[dict]) -> bool:
         """
@@ -491,15 +502,7 @@ class Model:
         """
         l = Logger()
 
-        # Guard Clause: Validate history index bounds
-        if not (0 <= index < len(self.messageHistories)):
-            l.log(f"History index {index} out of bounds.")
-            raise IndexError(
-                f"History index {index} out of range "
-                f"({len(self.messageHistories)} histories)."
-            )
-
-        history = self.messageHistories[index]
+        history = self._history(index)
         message = history[-1]
 
         raw_template = message[messageTextElement]
@@ -1198,15 +1201,7 @@ class Model:
         """
         l = Logger()
 
-        # Guard Clause: Ensure the index is within bounds
-        if not (0 <= index < len(self.messageHistories)):
-            l.log(f"History index {index} out of bounds.")
-            raise IndexError(
-                f"History index {index} out of range "
-                f"({len(self.messageHistories)} histories)."
-            )
-
-        history = self.messageHistories[index]
+        history = self._history(index)
         
         # Ensure history has messages and the last message came from the model
         if not history or history[-1].get(messageRoleElement) != modelRole:

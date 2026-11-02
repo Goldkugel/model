@@ -1,11 +1,11 @@
 # Data
 
-Output written while running `Model`. The locations of `logs/` and `tmp/` are set in [`config/config.yaml`](../config/config.yaml), the location of `slurmlogs/` in [`src/runTest.sh`](../src/runTest.sh); the paths below are the defaults.
+Output written while running `Model`. The locations of `logs/` and `tmp/` are set in [`config/config.yaml`](../config/config.yaml), the location of `slurmlogs/` in [`scripts/runTest.sh`](../scripts/runTest.sh); the paths below are the defaults.
 
 ```
 data/
 ├── logs/       # Run log (logger), prompt log (Model.logPrompts()) and run metadata
-├── slurmlogs/  # Output of Slurm jobs (src/runTest.sh)
+├── slurmlogs/  # Output of Slurm jobs (scripts/runTest.sh)
 └── tmp/        # Generation checkpoint (Model.generate())
 ```
 

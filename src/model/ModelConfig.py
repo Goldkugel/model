@@ -1,8 +1,3 @@
-import sys
-
-# Prevent Python from writing .pyc bytecode cache files to keep container environments clean
-sys.dont_write_bytecode = True
-
 from typing     import Literal, Optional
 from pydantic   import BaseModel, ConfigDict, Field
 

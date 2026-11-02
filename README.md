@@ -34,14 +34,18 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 │   └── tmp/             # Generation checkpoints
 ├── prompts/
 │   └── mapping.md       # Prompt template (HPO ↔ SNOMED CT mapping)
-├── src/                 # Installed as the `model` package
-│   ├── __init__.py
-│   ├── Model.py         # Model class (chat state, prompting, generation, checkpoints, cleanup)
-│   ├── ModelConfig.py   # Pydantic configuration schema
-│   ├── ModelUtils.py    # Role/device constants, file writers and run metadata helpers
-│   ├── ModelTest.py     # Pytest suite (+ a manual GPU diagnostic, see below)
+├── scripts/
 │   └── runTest.sh       # Slurm job running the GPU diagnostic
-├── conftest.py          # Registers stand-ins for vllm and torch when they are not installed
+├── src/
+│   └── model/           # The `model` package
+│       ├── __init__.py
+│       ├── Model.py         # Model class (chat state, prompting, generation, checkpoints, cleanup)
+│       ├── ModelConfig.py   # Pydantic configuration schema
+│       ├── ModelUtils.py    # Role/device constants, file writers and run metadata helpers
+│       └── diagnostic.py    # GPU diagnostic (python -m model.diagnostic)
+├── tests/
+│   ├── conftest.py      # Stand-ins for vllm and torch, temporary log folder
+│   └── ModelTest.py     # Pytest suite
 ├── LICENSE
 └── pyproject.toml
 ```
@@ -291,6 +295,7 @@ Version 2.1 is compatible with 2.0: existing code and configuration files keep w
 - Concurrent runs no longer overwrite each other: a checkpoint is only written by the run that created or imported it, it records the model and is not resumed with another one, and updates of the run metadata are locked. An answer must follow a user prompt.
 - Cut-off answers are marked, so `toJSON()` returns no fragments of cut-off JSON, and a DeepSeek-R1-style answer cut off during its reasoning is no longer taken for the answer.
 - Failures that were swallowed silently are logged (see [Errors](#errors)), and a model whose run metadata cannot be written is released before the error is raised.
+- Repository layout: the package lives in `src/model/`, the tests in `tests/` and the Slurm job in `scripts/`; the GPU diagnostic is `python -m model.diagnostic`. Import paths (`from model import Model`, `model.ModelUtils`, ...) are unchanged, but an editable install (`pip install -e .`) must be reinstalled once.
 
 ### Migrating from 1.x
 
@@ -302,18 +307,18 @@ Version 2.1 is compatible with 2.0: existing code and configuration files keep w
 
 ## Running Unit Tests
 
-The test suite needs neither a GPU nor a downloaded model, nor `vllm` and `torch` installed: tests that touch the engine replace `torch.cuda` and the vLLM classes via `monkeypatch`, and [`conftest.py`](./conftest.py) registers stand-ins for `vllm` and `torch` if they are not installed. Run the tests from the repository root, since the logger reads `./config/config.yaml`:
+The test suite needs neither a GPU nor a downloaded model, nor `vllm` and `torch` installed: tests that touch the engine replace `torch.cuda` and the vLLM classes via `monkeypatch`, and [`tests/conftest.py`](./tests/conftest.py) registers stand-ins for `vllm` and `torch` if they are not installed. It also points the logger at a temporary folder, so the tests write nothing into the repository and can be run from any folder:
 
 ```bash
 pytest -v
 ```
 
-`pytest` collects every `*Test.py` file in `src/` (configured in `pyproject.toml`). Besides the methods of `Model`, the tests cover resuming an interrupted run from its checkpoint, the GPU and logger set-up of the constructor, the helpers in `ModelUtils.py`, and the GPU diagnostic below, run with vLLM replaced. The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
+`pytest` collects every `*Test.py` file in [`tests/`](./tests/README.md) (configured in `pyproject.toml`). Besides the methods of `Model`, the tests cover resuming an interrupted run from its checkpoint, the GPU and logger set-up of the constructor, the helpers in `ModelUtils.py`, and the GPU diagnostic below, run with vLLM replaced. The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
 
-`src/ModelTest.py` can also be run directly as a GPU diagnostic: it loads a configured model and generates answers to two short prompts, checking that none is skipped or cut off and that `toJSON()` parses a JSON answer. Its checkpoint and run metadata go to a temporary folder, so the checkpoint of a real run is not overwritten. `src/runTest.sh` submits it as a Slurm job, writing its output to `data/slurmlogs/`; pass the index of the model in `model_id` to test another model than the first, e.g. a thinking model:
+The package also contains a GPU diagnostic, `python -m model.diagnostic [index]`, for a GPU node: it loads a configured model and generates answers to two short prompts, checking that none is skipped or cut off and that `toJSON()` parses a JSON answer. Its checkpoint and run metadata go to a temporary folder, so the checkpoint of a real run is not overwritten. [`scripts/runTest.sh`](./scripts/README.md) submits it as a Slurm job, writing its output to `data/slurmlogs/`; pass the index of the model in `model_id` to test another model than the first, e.g. a thinking model:
 
 ```bash
-cd src && sbatch runTest.sh 1
+cd scripts && sbatch runTest.sh 1
 ```
 
 ## License

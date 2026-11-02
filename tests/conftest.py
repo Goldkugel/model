@@ -8,12 +8,20 @@ imports them. If they are not installed (e.g. in CI or on a laptop without
 a GPU), minimal stand-ins are registered here so the package can still be
 imported. When the real packages are installed, they are used unchanged.
 
-This file lives in the repository root rather than in src/: pytest imports
-src/__init__.py (and with it vllm) before a conftest.py inside src/ runs.
+The Logger writes to a temporary folder during the tests, so they leave no
+log in the repository; tests that read repository files use REPO_ROOT, so
+they do not depend on the working directory.
 """
 
 import importlib.util
+import pathlib
 import sys
+
+import pytest
+from logger import Logger, LoggerConfig
+
+# Root of the repository, which holds config/ and prompts/
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 import types
 
 
@@ -60,3 +68,9 @@ if not _is_installed("vllm"):
     vllm.distributed = vllm_distributed
     sys.modules["vllm"] = vllm
     sys.modules["vllm.distributed"] = vllm_distributed
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _log_to_temporary_folder(tmp_path_factory):
+    """Points the process-wide Logger at a temporary folder for all tests."""
+    Logger.config = LoggerConfig(folder=str(tmp_path_factory.mktemp("logs")))
