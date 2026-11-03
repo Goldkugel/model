@@ -36,13 +36,12 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 │   └── mapping.md       # Prompt template (HPO ↔ SNOMED CT mapping)
 ├── scripts/
 │   └── runTest.sh       # Slurm job running the GPU diagnostic
-├── src/
-│   └── model/           # The `model` package
-│       ├── __init__.py
-│       ├── Model.py         # Model class (chat state, prompting, generation, checkpoints, cleanup)
-│       ├── ModelConfig.py   # Pydantic configuration schema
-│       ├── ModelUtils.py    # Role/device constants, file writers and run metadata helpers
-│       └── diagnostic.py    # GPU diagnostic (python -m model.diagnostic)
+├── src/                 # The `model` package
+│   ├── __init__.py
+│   ├── Model.py         # Model class (chat state, prompting, generation, checkpoints, cleanup)
+│   ├── ModelConfig.py   # Pydantic configuration schema
+│   ├── ModelUtils.py    # Role/device constants, file writers and run metadata helpers
+│   └── diagnostic.py    # GPU diagnostic (python -m model.diagnostic)
 ├── tests/
 │   ├── conftest.py      # Stand-ins for vllm and torch, temporary log folder
 │   └── ModelTest.py     # Pytest suite
@@ -295,7 +294,7 @@ Version 2.1 is compatible with 2.0: existing code and configuration files keep w
 - Concurrent runs no longer overwrite each other: a checkpoint is only written by the run that created or imported it, it records the model and is not resumed with another one, and updates of the run metadata are locked. An answer must follow a user prompt.
 - Cut-off answers are marked, so `toJSON()` returns no fragments of cut-off JSON, and a DeepSeek-R1-style answer cut off during its reasoning is no longer taken for the answer.
 - Failures that were swallowed silently are logged (see [Errors](#errors)), and a model whose run metadata cannot be written is released before the error is raised.
-- Repository layout: the package lives in `src/model/`, the tests in `tests/` and the Slurm job in `scripts/`; the GPU diagnostic is `python -m model.diagnostic`. Import paths (`from model import Model`, `model.ModelUtils`, ...) are unchanged, but an editable install (`pip install -e .`) must be reinstalled once.
+- Repository layout: the package lives in `src/`, the tests in `tests/` and the Slurm job in `scripts/`; the GPU diagnostic is `python -m model.diagnostic`. Import paths (`from model import Model`, `model.ModelUtils`, ...) are unchanged, but an editable install (`pip install -e .`) must be reinstalled once.
 
 ### Migrating from 1.x
 

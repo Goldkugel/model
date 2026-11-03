@@ -1,8 +1,8 @@
 # Source
 
-The source code of the `model` package, in `model/` (installed from this folder, see `pyproject.toml`).
+The source code of the `model` package (installed from this folder as `model`, see `pyproject.toml`).
 
-| File in `model/` | Content |
+| File | Content |
 |---|---|
 | `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `messageReasoningElement`, `messageTruncatedElement`, `gpu`, `cpu` |
 | `Model.py` | `Model` class: loads a model into vLLM (configured from a YAML file, a dict or a `ModelConfig`), manages the conversation histories, fills prompt templates, generates answers in chunks (skipping prompts longer than the context, splitting off the reasoning of thinking models, logging progress), writes and reads checkpoints, writes the run metadata, parses JSON answers and frees GPU memory |
