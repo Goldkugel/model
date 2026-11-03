@@ -5,11 +5,11 @@ Log files written while running `Model`. `*.log` and `*.json` files are ignored 
 | File | Written by | Config |
 |---|---|---|
 | `output.log` | [`logger`](https://github.com/Goldkugel/logger), throughout the run | `logger.folder`, `logger.file_name` |
-| `prompts.log` | `Model.logPrompts()` | `llm.prompt_log_folder`, `llm.prompt_log_file` |
+| `prompts_<model>.log` | `Model.logPrompts()`; named after the model and the postfix (`Model.setPostfix()`), e.g. `prompts_medgemma-4b-it.log` for `prompts.log` | `llm.prompt_log_folder`, `llm.prompt_log_file` |
 | `run_metadata.json` | `Model`, when the model is loaded and after every `generate()` call | `llm.metadata_folder`, `llm.metadata_file` |
 | `run_metadata.json.lock` | `Model`, as a lock while it updates the run metadata; empty, and safe to delete when no run is active | |
 
-## `prompts.log`
+## `prompts_<model>.log`
 
 A semicolon-delimited file with one row per message of every conversation history. It is overwritten on every call of `logPrompts()`.
 
@@ -27,7 +27,7 @@ history;prompt;role;length;text
 | `length` | Length of the original message in characters |
 | `text` | The message, with line breaks replaced by spaces and `;` by `,` |
 
-The reasoning of thinking models is not logged; it is kept in the checkpoint. Because the text is altered to keep one message per row, this file is meant for reading only. To save and restore histories, use the checkpoint in [`data/tmp/`](../tmp/README.md).
+The reasoning of thinking models is not logged; it is kept in the answer store. Because the text is altered to keep one message per row, this file is meant for reading only. Answers are restored from the answer store in [`data/tmp/`](../tmp/README.md): build the same histories again and call `generate()`.
 
 ## `run_metadata.json`
 

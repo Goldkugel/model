@@ -40,8 +40,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --no-deps .
           python -m pip install \
-            "logger @ git+https://github.com/Goldkugel/logger.git@v1.4.0" \
-            pandas "pydantic>=2" pyyaml pytest
+            "logger @ git+https://github.com/Goldkugel/logger.git@v1.5.0" \
+            "pydantic>=2" pyyaml pytest
 
       # Runs every *Test.py file in tests/ (see [tool.pytest.ini_options] in
       # pyproject.toml).

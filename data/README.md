@@ -5,7 +5,7 @@ Output written while running `Model`. The locations of `logs/` and `tmp/` are se
 ```
 data/
 ├── logs/       # Run log (logger), prompt log (Model.logPrompts()) and run metadata
-└── tmp/        # Generation checkpoint (Model.generate())
+└── tmp/        # Answer stores, the checkpoints of Model.generate()
 ```
 
 See [`logs/README.md`](./logs/README.md) and [`tmp/README.md`](./tmp/README.md) for the files in each folder.

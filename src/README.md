@@ -5,9 +5,10 @@ The source code of the `model` package (installed from this folder as `model`, s
 | File | Content |
 |---|---|
 | `__init__.py` | Package exports: `Model`, `ModelConfig`, `messageRoleElement`, `messageTextElement`, `messageReasoningElement`, `messageTruncatedElement`, `gpu`, `cpu` |
-| `Model.py` | `Model` class: loads a model into vLLM (configured from a YAML file, a dict or a `ModelConfig`), manages the conversation histories, fills prompt templates, generates answers in chunks (skipping prompts longer than the context, splitting off the reasoning of thinking models, logging progress), writes and reads checkpoints, writes the run metadata, parses JSON answers and frees GPU memory |
+| `Model.py` | `Model` class: loads a model into vLLM (configured from a YAML file, a dict or a `ModelConfig`), manages the conversation histories, fills prompt templates, generates answers in chunks (using and filling the answer store, skipping prompts longer than the context, splitting off the reasoning of thinking models, logging progress), writes the run metadata, parses JSON answers and frees GPU memory |
 | `ModelConfig.py` | `ModelConfig`, the pydantic schema of the `llm` config section |
-| `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log, atomic writers for checkpoints (`writeCheckpointCSV()`) and JSON (`writeJSON()`), the locked run metadata update (`updateRunRecord()`), and helpers for the run metadata (package versions, model revision, file hashes) |
+| `AnswerStore.py` | `AnswerStore`: the prompts and answers in a JSON file, as a tree by turn keyed by the SHA-256 of every prompt, with the settings they were generated with; merged with other runs under a lock |
+| `ModelUtils.py` | Role, device and dictionary-key constants, `writePrompt()` for the prompt log, the file lock and JSON writer of the logger package (`lockedFile()`, `writeJSON()`), the locked run metadata update (`updateRunRecord()`), and helpers for the run metadata (package versions, model revision, file hashes) |
 
 ## Import side effects
 

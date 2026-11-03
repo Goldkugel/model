@@ -12,13 +12,7 @@ from .ModelUtils        import (
     messageTextElement,
     messageReasoningElement,
     messageTruncatedElement,
-    systemColumn,
-    reasoningColumnSuffix,
-    truncatedColumnSuffix,
-    modelColumn,
     writePrompt,
-    writeCheckpointCSV,
-    fileStamp,
     updateRunRecord,
     metadataPackages,
     packageVersions,
@@ -26,10 +20,11 @@ from .ModelUtils        import (
     fileSHA256,
     target_device,
 )
+from .AnswerStore       import AnswerStore
 from logger             import Logger, LoggerConfig
 from pathlib            import Path
 from datetime           import datetime
-import pandas           as pd
+import json
 import logging
 import os
 import platform
@@ -42,7 +37,6 @@ import torch
 import yaml
 import json
 import re
-import csv
 
 # Suppress verbose vLLM initialization and internal status logs
 logging.getLogger("vllm").setLevel(logging.ERROR)
@@ -132,9 +126,15 @@ class Model:
         self.modelIndex: int = index
         self.gpuCount: int = 0
         self.generationStats: list[dict] = []
-        # (path, fileStamp()) of the checkpoint as this instance last wrote
-        # or imported it; see _checkCheckpointOwnership()
-        self.checkpointStamp: Optional[tuple] = None
+        # The stored prompts and answers (the checkpoint), loaded by the first
+        # generate() call; see _answerStore()
+        self.store: Optional[AnswerStore] = None
+        # Hugging Face revision of the model, looked up once by _modelRevision()
+        self.revision: Optional[str] = None
+        self.revisionLooked: bool = False
+        # Added to the names of the checkpoint and the prompt log, after the
+        # model name; see setPostfix() and _fileName()
+        self.postfix: str = ""
 
         # --- Step 1: Load and Validate Configuration ---
         self.config, logger_path, logger_settings = Model._resolveConfig(config)
@@ -314,17 +314,17 @@ class Model:
             raise TypeError("addPrompt: 'message' must be a list of strings, not a string.")
 
         # Other roles (e.g. Gemini's "model") are not understood by the chat
-        # templates, by generate() or by the checkpoint, which would store
-        # them as user prompts.
+        # templates, by generate() or by the answer store, which would store
+        # them as prompts.
         if message and role not in chatRoles:
             error = f"addPrompt: unknown role '{role}'; expected one of {list(chatRoles)}."
             l.log(error)
             raise ValueError(error)
 
         # An empty answer (a thinking model cut off during its reasoning)
-        # must be generated again before the next turn: the checkpoint does
-        # not store empty answers, so a resumed run would see two prompts in
-        # a row and never answer the first one.
+        # must be generated again before the next turn: the answer store does
+        # not store empty answers, so the next turn would be answered without
+        # an answer to this one.
         if message and self.messageHistories:
             empty = [
                 idx for idx, history in enumerate(self.messageHistories)
@@ -338,10 +338,10 @@ class Model:
                 l.log(error)
                 raise ValueError(error)
 
-        # An answer must follow a user prompt. The checkpoint stores turns as
-        # prompt/answer pairs, so an answer without a prompt before it (at
-        # the start of a history, after a system prompt or after another
-        # answer) would come back with an empty prompt inserted.
+        # An answer must follow a user prompt. The answer store pairs every
+        # answer with the prompt before it, so an answer at the start of a
+        # history or after another answer would be stored as a prompt, and
+        # one after a system prompt as the answer to the system prompt.
         if message and role == modelRole:
             without_prompt = [
                 idx for idx, history in enumerate(self.messageHistories)
@@ -527,21 +527,28 @@ class Model:
     def generate(self) -> int:
         """
         Generates an answer for every history that does not end with a model
-        answer yet. Histories are sent to vLLM's chat interface, which
-        formats them with the tokenizer's chat template, in chunks of
-        config.chunk_size; after every chunk the answers are appended to
-        their histories and all histories are written to the checkpoint file
-        (see exportHistoriesToFile()), so an interrupted run can be resumed
-        with importHistoriesFromFile().
+        answer yet.
+
+        Answers stored in the answer store (the checkpoint, see
+        _answerStore()) are used instead of being generated again: for a
+        history whose prompts, and earlier answers, are stored with an
+        answer. Histories that are identical (the same prompts and answers so
+        far) are generated once and get the same answer. The others are sent
+        to vLLM's chat interface, which formats them with the tokenizer's
+        chat template, in chunks of config.chunk_size; after every chunk the
+        answers are appended to their histories and stored, so an
+        interrupted run is resumed by calling generate() again with the same
+        prompts.
 
         For thinking models, the reasoning is split off the answer (see
         _splitReasoning()): the answer becomes the message text, the
         reasoning is stored under messageReasoningElement on the same
         message and is never sent back to the model. Answers cut off at
         config.max_tokens are listed in self.truncatedHistories; a thinking
-        model cut off during its reasoning gets an empty answer, which the
-        next generate() call replaces by a new one (with the same seed and
-        settings, it is cut off again, so raise max_tokens first).
+        model cut off during its reasoning gets an empty answer, which is not
+        stored and which the next generate() call replaces by a new one (with
+        the same seed and settings, it is cut off again, so raise max_tokens
+        first).
 
         A history whose prompt does not fit into config.max_model_len is
         skipped instead of failing its whole chunk: it keeps no answer, its
@@ -551,11 +558,12 @@ class Model:
         Progress and throughput are logged after every chunk, and the
         statistics of the call are added to the run metadata file.
 
-        :return: Number of answers generated.
+        :return: Number of answers generated (not counting stored answers and
+            the copies for identical histories).
+        :raises ValueError: If the answer store was written with other
+            settings (see AnswerStore); checked before anything is generated.
         :raises RuntimeError: If there is something to generate but the
-            model was closed with close(), or if the checkpoint file belongs
-            to another run (see _checkCheckpointOwnership()); both are
-            checked before anything is generated.
+            model was closed with close().
         """
         l = Logger()
         self.skippedHistories = []
@@ -576,13 +584,9 @@ class Model:
             l.log("No histories without an answer; nothing to generate.")
             return 0
 
-        if self.llm is None:
-            l.log("generate() called after close().")
-            raise RuntimeError("The model was closed with close(); create a new Model to generate.")
-
-        # Fail now rather than after the first chunk if the checkpoint
-        # belongs to another run
-        self._checkCheckpointOwnership(self._checkpointPath())
+        # Fails now, before anything is generated, if the stored answers were
+        # generated with other settings
+        store = self._answerStore()
 
         # Empty answers are replaced: remove them, so the prompt before them
         # is answered again
@@ -590,97 +594,146 @@ class Model:
             if Model._endsWithEmptyAnswer(self.messageHistories[idx]):
                 self.messageHistories[idx].pop()
 
-        tokenizer = self.llm.get_tokenizer()
-        # Whether the chat template opens the reasoning in the prompt (e.g.
-        # DeepSeek-R1); the same for every history, as they share template
-        # and settings
-        prompt_opens_reasoning = self._promptOpensReasoning(
-            tokenizer, self.messageHistories[unprocessed_indices[0]]
-        )
-        chunk_size = self.config.chunk_size
-        total = len(unprocessed_indices)
-        # Number of chunks, i.e. total / chunk_size rounded up
-        chunk_count = -(-total // chunk_size)
-
-        l.log(f"Starting generation for {total} unprocessed histories in {chunk_count} chunk(s) of up to {chunk_size}...")
-
         started = datetime.now().astimezone().isoformat(timespec="seconds")
         run_start = time.perf_counter()
-        done = 0
+
+        # 2. Use the stored answers
+        missing_indices = []
+        reused = 0
+        for idx in unprocessed_indices:
+            answer = store.answerFor(self.messageHistories[idx])
+            if answer is None:
+                missing_indices.append(idx)
+                continue
+            self.messageHistories[idx].append(answer)
+            reused += 1
+            if answer.get(messageTruncatedElement):
+                self.truncatedHistories.append(idx)
+        if reused:
+            l.log(f"Using {reused} stored answers of {len(unprocessed_indices)} histories without an answer.")
+
+        # 3. Identical histories are generated once: the first of them is
+        # generated, the others get a copy of its answer
+        copies: dict[int, list[int]] = {}
+        first_of: dict[str, int] = {}
+        generate_indices = []
+        for idx in missing_indices:
+            key = json.dumps(self._chatMessages(self.messageHistories[idx]), ensure_ascii=False)
+            if key in first_of:
+                copies[first_of[key]].append(idx)
+            else:
+                first_of[key] = idx
+                copies[idx] = []
+                generate_indices.append(idx)
+        shared = len(missing_indices) - len(generate_indices)
+
         generated = 0
         prompt_tokens = 0
         output_tokens = 0
         reasoning_tokens = 0
 
-        # 2. Process inference in chunked batches
-        for chunk_number, i in enumerate(range(0, total, chunk_size), start=1):
-            chunk_indices = unprocessed_indices[i : i + chunk_size]
-            chunk_start = time.perf_counter()
+        if generate_indices and self.llm is None:
+            l.log("generate() called after close().")
+            raise RuntimeError("The model was closed with close(); create a new Model to generate.")
 
-            # Leave out prompts that do not fit into the context window: vLLM
-            # would reject the whole chunk because of a single one of them
-            batch_indices = [idx for idx in chunk_indices if self._fitsContext(tokenizer, idx)]
-            chunk_output_tokens = 0
+        if generate_indices:
+            tokenizer = self.llm.get_tokenizer()
+            # Whether the chat template opens the reasoning in the prompt (e.g.
+            # DeepSeek-R1); the same for every history, as they share template
+            # and settings
+            prompt_opens_reasoning = self._promptOpensReasoning(
+                tokenizer, self.messageHistories[generate_indices[0]]
+            )
+            chunk_size = self.config.chunk_size
+            total = len(generate_indices)
+            # Number of chunks, i.e. total / chunk_size rounded up
+            chunk_count = -(-total // chunk_size)
 
-            if batch_indices:
-                l.log(f"Running vLLM generation for chunk {chunk_number}/{chunk_count} [Indices {batch_indices[0]} to {batch_indices[-1]}]...")
+            l.log(f"Starting generation for {total} unprocessed histories in {chunk_count} chunk(s) of up to {chunk_size}"
+                  + (f" ({shared} identical histories get the same answers)" if shared else "") + "...")
 
-                # Run batched generation over the chat histories
-                results = self.llm.chat(
-                    [self._chatMessages(self.messageHistories[idx]) for idx in batch_indices],
-                    self.sampling_params,
-                    use_tqdm=False,
-                    **self._chatTemplateArguments()
+            done = 0
+
+            # 4. Process inference in chunked batches
+            for chunk_number, i in enumerate(range(0, total, chunk_size), start=1):
+                chunk_indices = generate_indices[i : i + chunk_size]
+                chunk_start = time.perf_counter()
+
+                # Leave out prompts that do not fit into the context window: vLLM
+                # would reject the whole chunk because of a single one of them
+                batch_indices = [idx for idx in chunk_indices if self._fitsContext(tokenizer, idx)]
+                for idx in chunk_indices:
+                    if idx not in batch_indices:
+                        self.skippedHistories.extend(copies[idx])
+                chunk_output_tokens = 0
+
+                if batch_indices:
+                    l.log(f"Running vLLM generation for chunk {chunk_number}/{chunk_count} [Indices {batch_indices[0]} to {batch_indices[-1]}]...")
+
+                    # Run batched generation over the chat histories
+                    results = self.llm.chat(
+                        [self._chatMessages(self.messageHistories[idx]) for idx in batch_indices],
+                        self.sampling_params,
+                        use_tqdm=False,
+                        **self._chatTemplateArguments()
+                    )
+
+                    # 5. Append outputs back to their respective histories, and
+                    # their identical histories, with the reasoning of thinking
+                    # models split off the answer
+                    for idx, result in zip(batch_indices, results):
+                        completion = result.outputs[0]
+                        truncated = getattr(completion, "finish_reason", None) == "length"
+                        reasoning, answer = self._splitReasoning(
+                            str(completion.text), truncated, prompt_opens_reasoning
+                        )
+                        message = {
+                            messageRoleElement: modelRole,
+                            messageTextElement: answer
+                        }
+                        if truncated:
+                            message[messageTruncatedElement] = True
+                        if reasoning:
+                            message[messageReasoningElement] = reasoning
+                            # vLLM only reports the token count of the whole
+                            # output, so the reasoning is tokenized again to
+                            # estimate its share (approximate: the tags and the
+                            # whitespace stripped by _splitReasoning() are lost)
+                            reasoning_tokens += len(tokenizer.encode(reasoning, add_special_tokens=False))
+                        for target in [idx] + copies[idx]:
+                            self.messageHistories[target].append(dict(message))
+                            if truncated:
+                                self.truncatedHistories.append(target)
+                        prompt_tokens += len(result.prompt_token_ids or [])
+                        chunk_output_tokens += len(completion.token_ids or [])
+
+                        # Identical histories share their nodes in the store
+                        store.add(self.messageHistories[idx])
+
+                    # 6. Store the answers after every chunk, so a killed job
+                    # (e.g. by a Slurm time limit) loses at most one chunk of work
+                    store.save()
+
+                output_tokens += chunk_output_tokens
+                done += len(chunk_indices)
+                generated += len(batch_indices)
+
+                # 7. Log progress, throughput and the estimated remaining time
+                chunk_seconds = time.perf_counter() - chunk_start
+                elapsed = time.perf_counter() - run_start
+                # Extrapolated from the average time per history so far, skipped
+                # histories included
+                remaining = elapsed / done * (total - done)
+                l.log(
+                    f"Chunk {chunk_number}/{chunk_count}: {len(batch_indices)} answers, "
+                    f"{chunk_output_tokens} tokens in {chunk_seconds:.1f} s "
+                    f"({_rate(chunk_output_tokens, chunk_seconds)} tokens/s). "
+                    f"Progress: {done}/{total} histories, elapsed {_duration(elapsed)}, "
+                    f"remaining ~{_duration(remaining)}."
                 )
 
-                # 3. Append outputs back to their respective histories, with
-                # the reasoning of thinking models split off the answer
-                for idx, result in zip(batch_indices, results):
-                    completion = result.outputs[0]
-                    truncated = getattr(completion, "finish_reason", None) == "length"
-                    reasoning, answer = self._splitReasoning(
-                        str(completion.text), truncated, prompt_opens_reasoning
-                    )
-                    message = {
-                        messageRoleElement: modelRole,
-                        messageTextElement: answer
-                    }
-                    if truncated:
-                        message[messageTruncatedElement] = True
-                    if reasoning:
-                        message[messageReasoningElement] = reasoning
-                        # vLLM only reports the token count of the whole
-                        # output, so the reasoning is tokenized again to
-                        # estimate its share (approximate: the tags and the
-                        # whitespace stripped by _splitReasoning() are lost)
-                        reasoning_tokens += len(tokenizer.encode(reasoning, add_special_tokens=False))
-                    self.messageHistories[idx].append(message)
-                    if truncated:
-                        self.truncatedHistories.append(idx)
-                    prompt_tokens += len(result.prompt_token_ids or [])
-                    chunk_output_tokens += len(completion.token_ids or [])
-
-                # 4. Write a checkpoint after every chunk, so a killed job
-                # (e.g. by a Slurm time limit) loses at most one chunk of work
-                self.exportHistoriesToFile()
-
-            output_tokens += chunk_output_tokens
-            done += len(chunk_indices)
-            generated += len(batch_indices)
-
-            # 5. Log progress, throughput and the estimated remaining time
-            chunk_seconds = time.perf_counter() - chunk_start
-            elapsed = time.perf_counter() - run_start
-            # Extrapolated from the average time per history so far, skipped
-            # histories included
-            remaining = elapsed / done * (total - done)
-            l.log(
-                f"Chunk {chunk_number}/{chunk_count}: {len(batch_indices)} answers, "
-                f"{chunk_output_tokens} tokens in {chunk_seconds:.1f} s "
-                f"({_rate(chunk_output_tokens, chunk_seconds)} tokens/s). "
-                f"Progress: {done}/{total} histories, elapsed {_duration(elapsed)}, "
-                f"remaining ~{_duration(remaining)}."
-            )
+        self.skippedHistories.sort()
+        self.truncatedHistories.sort()
 
         elapsed = time.perf_counter() - run_start
         if self.skippedHistories:
@@ -691,18 +744,21 @@ class Model:
         if reasoning_tokens:
             l.log(f"Of the generated tokens, about {reasoning_tokens} were reasoning.")
         l.log(
-            f"Generation completed: {generated} answers, {prompt_tokens} prompt "
+            f"Generation completed: {generated} answers generated, {reused} stored and "
+            f"{shared} shared with identical histories; {prompt_tokens} prompt "
             f"and {output_tokens} generated tokens in {_duration(elapsed)} "
             f"({_rate(output_tokens, elapsed)} generated tokens/s)."
         )
 
-        # 6. Record the statistics of this call in the run metadata
+        # 8. Record the statistics of this call in the run metadata
         self.generationStats.append({
             "started": started,
             "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
             "seconds": round(elapsed, 1),
-            "histories": total,
+            "histories": len(unprocessed_indices),
             "answers": generated,
+            "stored": reused,
+            "shared": shared,
             "skipped": list(self.skippedHistories),
             "truncated": list(self.truncatedHistories),
             "prompt_tokens": prompt_tokens,
@@ -871,7 +927,7 @@ class Model:
             "model": {
                 "id": self.model,
                 "index": self.modelIndex,
-                "revision": modelRevision(self.model),
+                "revision": self._modelRevision(),
             },
             "gpus": {
                 "count": self.gpuCount,
@@ -879,308 +935,114 @@ class Model:
                 "cuda": getattr(getattr(torch, "version", None), "cuda", None),
             },
             "prompt_files": prompt_hashes,
+            "files": {
+                "checkpoint": self._checkpointPath(),
+                "prompt_log": self._promptLogPath(),
+            },
             "config": self.config.model_dump(),
             "generations": self.generationStats,
         }
 
         updateRunRecord(path, record)
 
-    def _get_column_names(self, turn_idx: int) -> tuple[str, str]:
+    def _fileName(self, file_name: str) -> str:
         """
-        Derives the (prompt_column, answer_column) name pair for a given
-        turn index, used to keep export/import column naming consistent.
-
-        The prompt column is named after the stem of the corresponding
-        config.prompt_files entry (e.g. "hpo_mapping" for "hpo_mapping.md"),
-        or "prompt{turn_idx + 1}" if no prompt file exists at that index
-        (e.g. for turns added programmatically rather than from a template
-        file). The answer column is the prompt column name with "_answer"
-        appended; the reasoning column of a thinking model's answer is the
-        prompt column name with reasoningColumnSuffix appended.
-
-        :param turn_idx: Zero-based index of the prompt/answer turn.
-        :return: Tuple of (prompt_column_name, answer_column_name).
+        The name of a file of this model: `file_name` with the model name
+        (getModelName()) and the postfix (setPostfix()) added before its
+        extension, e.g. "answers_medgemma-4b-it_test.json" for "answers.json".
         """
-        prompt_files = self.config.prompt_files
-        if turn_idx < len(prompt_files):
-            base_name = Path(prompt_files[turn_idx]).stem
-        else:
-            base_name = f"prompt{turn_idx + 1}"
-        return base_name, f"{base_name}_answer"
-
-    def exportHistoriesToFile(self) -> int:
-        """
-        Writes all messageHistories to the checkpoint file
-        (config.prompt_tmp_folder / config.prompt_tmp_file), one row per
-        history. The system prompt is stored in the "system" column; each
-        user prompt and its answer are stored in a prompt/answer column pair
-        named by _get_column_names(). The reasoning of a thinking model's
-        answer is stored in "<prompt column>_reasoning", and cut-off answers
-        are marked in "<prompt column>_truncated"; these columns only exist
-        if some answer of that turn needs them. The "_model" column records
-        the model, so that importHistoriesFromFile() can refuse to resume
-        the checkpoint with another one.
-
-        The checkpoint is only overwritten if this instance wrote or
-        imported it last (see _checkCheckpointOwnership()).
-
-        :return: Number of rows written.
-        :raises ValueError: If there are no histories.
-        :raises RuntimeError: If the checkpoint file was written by another
-            run (see _checkCheckpointOwnership()).
-        """
-        l = Logger()
-
-        # 1. Resolve output file path
-        target_file = self._checkpointPath()
-
-        # 2. Nothing to export without histories
-        histories = self.getMessageHistories()
-        if not histories:
-            l.log("No messageHistories available to export.")
-            raise ValueError("No message histories to export.")
-
-        # Never overwrite the checkpoint of another run
-        self._checkCheckpointOwnership(target_file)
-
-        # 3. Transform histories into row dictionaries
-        rows_data = []
-        for history in histories:
-            row_dict = {modelColumn: self.model or ""}
-            prompt_counter = 0
-
-            for turn in history:
-                role = turn.get(messageRoleElement)
-                text = turn.get(messageTextElement)
-                
-                if role == modelRole:
-                    # Model response pairs with the current active prompt index
-                    prompt_col, ans_col = self._get_column_names(prompt_counter)
-                    row_dict[ans_col] = str(text).strip() if text else ""
-                    # The reasoning of a thinking model gets its own column
-                    reasoning = turn.get(messageReasoningElement)
-                    if reasoning:
-                        row_dict[prompt_col + reasoningColumnSuffix] = str(reasoning)
-                    if turn.get(messageTruncatedElement):
-                        row_dict[prompt_col + truncatedColumnSuffix] = "true"
-                    prompt_counter += 1
-                elif role == systemRole:
-                    # System prompts get a dedicated column so the import
-                    # can restore them with the system role
-                    row_dict[systemColumn] = str(text) if text else ""
-                else:
-                    # User prompts get their own column slot
-                    prompt_col, _ = self._get_column_names(prompt_counter)
-
-                    # If this slot is already filled (e.g. two consecutive
-                    # user prompts), advance to the next column slot
-                    if prompt_col in row_dict:
-                        prompt_counter += 1
-                        prompt_col, _ = self._get_column_names(prompt_counter)
-
-                    row_dict[prompt_col] = str(text) if text else ""
-
-            rows_data.append(row_dict)
-
-        # 4. Build the DataFrame. Its columns are the union of all rows'
-        # keys, so histories with fewer turns get empty cells, which the
-        # import skips.
-        df = pd.DataFrame(rows_data)
-
-        # 5. Write atomically, so an interrupted write never corrupts the
-        # previous checkpoint, and remember the written version
-        written = writeCheckpointCSV(df, target_file)
-        self.checkpointStamp = (target_file, fileStamp(target_file))
-        return written
+        stem, extension = os.path.splitext(file_name)
+        parts = [stem, self.getModelName(), self.postfix]
+        return "_".join(part for part in parts if part) + extension
 
     def _checkpointPath(self) -> str:
-        """Returns the path of the checkpoint file."""
-        return os.path.join(self.config.prompt_tmp_folder, self.config.prompt_tmp_file)
-
-    def _checkCheckpointOwnership(self, path: str) -> None:
         """
-        Makes sure that writing the checkpoint at `path` cannot destroy the
-        work of another run. Passes if there is no file yet, or if the file
-        is unchanged since this instance last wrote or imported it.
-
-        Two runs sharing a checkpoint (the same prompt_tmp_folder and
-        prompt_tmp_file, e.g. two models or the jobs of a Slurm job array
-        started with one config) would otherwise overwrite each other's
-        checkpoint after every chunk, and a resumed run would continue with
-        the other run's histories.
-
-        :raises RuntimeError: If the file exists but was not written or
-            imported by this instance, or was changed since.
+        Returns the path of the checkpoint file: config.prompt_tmp_file in
+        config.prompt_tmp_folder, named after the model and the postfix.
         """
-        current = fileStamp(path)
-        if current is None or self.checkpointStamp == (path, current):
-            return
+        return os.path.join(self.config.prompt_tmp_folder, self._fileName(self.config.prompt_tmp_file))
 
-        if self.checkpointStamp is not None and self.checkpointStamp[0] == path:
-            problem = "was changed by another run since this run last wrote or imported it"
-        else:
-            problem = "already exists and was not imported by this run"
-        error = (
-            f"Checkpoint '{path}' {problem}. Give every concurrent run its own "
-            f"prompt_tmp_file; to resume this checkpoint, call "
-            f"importHistoriesFromFile() first; to start over, delete it."
-        )
-        Logger().log(error)
-        raise RuntimeError(error)
-
-    def importHistoriesFromFile(self) -> int:
+    def _promptLogPath(self) -> str:
         """
-        Replaces self.messageHistories with the histories stored in the
-        checkpoint file (config.prompt_tmp_folder / config.prompt_tmp_file),
-        as written by exportHistoriesToFile().
-
-        Reconstructs multi-turn conversation histories by mapping the
-        "system" column and the prompt/answer column pairs back into
-        role-message dictionaries, and restores the reasoning of answers
-        from the reasoning columns. Empty answer cells are skipped, so a
-        history whose last answer is missing (e.g. an answer cut off during
-        the reasoning) is generated again by generate(). Empty prompts are
-        kept up to the last turn with text, and a row without any text
-        becomes an empty history, so every history keeps its index.
-
-        The column names are derived from config.prompt_files (see
-        _get_column_names()), so the checkpoint must be read with the same
-        prompt_files it was written with.
-
-        :return: Total number of message histories populated.
-        :raises FileNotFoundError: If the checkpoint file does not exist,
-            e.g. because no earlier run was interrupted.
-        :raises ValueError: If the checkpoint is empty, has no prompt/answer
-            columns, or was written with another model.
+        Returns the path of the prompt log: config.prompt_log_file in
+        config.prompt_log_folder, named after the model and the postfix.
         """
-        l = Logger()
+        return os.path.join(self.config.prompt_log_folder, self._fileName(self.config.prompt_log_file))
 
-        # 1. Load the checkpoint file
-        target_file = self._checkpointPath()
+    def setPostfix(self, postfix: str = "") -> None:
+        """
+        Sets the postfix added to the names of the checkpoint (the answer
+        store) and the prompt log, after the model name, e.g.
+        "answers_medgemma-4b-it_fewshot.json" for config.prompt_tmp_file
+        "answers.json" and the postfix "fewshot". Runs of the same model with
+        other settings thereby get their own files; "" removes the postfix.
+        The next generate() call uses the answer store of the new name.
 
-        if not os.path.exists(target_file):
-            l.log(f"File not found at '{target_file}'. Cannot populate messageHistories.")
-            raise FileNotFoundError(f"Checkpoint file not found at '{target_file}'.")
+        :param postfix: Text added to the file names.
+        :raises ValueError: If `postfix` contains a path separator.
+        """
+        if "/" in postfix or os.sep in postfix:
+            raise ValueError(f"The postfix '{postfix}' must not contain a path separator.")
 
-        # Read every cell as a literal string: without dtype=str and
-        # keep_default_na=False, answers such as "NA" or "None" would be
-        # parsed as missing (and regenerated), and "1" would become "1.0".
-        try:
-            df = pd.read_csv(
-                target_file,
-                sep=";",
-                quoting=csv.QUOTE_ALL,
-                dtype=str,
-                keep_default_na=False
-            )
-        except pd.errors.EmptyDataError:
-            df = None
+        self.postfix = postfix
+        self.store = None
+        Logger().log(f"Checkpoint: '{self._checkpointPath()}', prompt log: '{self._promptLogPath()}'.")
 
-        if df is None or df.empty:
-            l.log("DataFrame is empty or None. Cannot populate histories.")
-            raise ValueError(f"Checkpoint file '{target_file}' contains no histories.")
+    def hasCheckpoint(self) -> bool:
+        """
+        Whether the checkpoint (the answer store) of this model exists (see
+        _checkpointPath()), i.e. whether generate() finds answers of an
+        earlier run.
+        """
+        return os.path.isfile(self._checkpointPath())
 
-        # Resuming with another model would mix the answers of two models.
-        # Checkpoints written before the "_model" column existed are
-        # accepted.
-        if modelColumn in df.columns:
-            checkpoint_models = set(df[modelColumn]) - {""}
-            if checkpoint_models and checkpoint_models != {self.model}:
-                error = (
-                    f"Checkpoint '{target_file}' was written with model "
-                    f"{sorted(checkpoint_models)}, not '{self.model}'."
-                )
-                l.log(error)
-                raise ValueError(error)
+    def _answerSettings(self) -> dict:
+        """
+        The settings the answers depend on, stored with them in the answer
+        store: answers generated with other settings are not reused (see
+        AnswerStore). Settings that only change where files are written or
+        how fast the model runs (folders, chunk_size, GPU memory, batching)
+        are not part of them.
+        """
+        return {
+            "model": self.model,
+            "revision": self._modelRevision(),
+            "seed": self.config.seed,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "max_tokens": self.config.max_tokens,
+            "max_model_len": self.config.max_model_len,
+            "dtype": self.config.dtype,
+            "quantization": self.config.quantization,
+            "enable_thinking": self.config.enable_thinking,
+            "reasoning_start_tag": self.config.reasoning_start_tag,
+            "reasoning_end_tag": self.config.reasoning_end_tag,
+        }
 
-        # 2. Identify all prompt/answer column pairs present in the DataFrame,
-        # turn by turn until the first turn with neither column
-        column_pairs = []
-        prompt_counter = 0
+    def _modelRevision(self) -> Optional[str]:
+        """
+        The Hugging Face revision of the model (see modelRevision()), looked
+        up once, so that a model missing from the local cache is logged once.
+        """
+        if not self.revisionLooked and self.model is not None:
+            self.revision = modelRevision(self.model)
+            self.revisionLooked = True
+        return self.revision
 
-        while True:
-            prompt_col, ans_col = self._get_column_names(prompt_counter)
-            
-            # Stop when neither column exists in the DataFrame
-            if prompt_col not in df.columns and ans_col not in df.columns:
-                break
+    def _answerStore(self) -> AnswerStore:
+        """
+        The answer store (the checkpoint) of this model: its prompts and
+        answers in a JSON file (see AnswerStore and _checkpointPath()),
+        loaded on first use.
 
-            column_pairs.append((prompt_col, ans_col))
-            prompt_counter += 1
-
-        if not column_pairs:
-            l.log("No valid prompt/answer columns found in DataFrame.")
-            raise ValueError(f"Checkpoint file '{target_file}' has no prompt/answer columns.")
-
-        # 3. Reconstruct messageHistories row by row
-        new_message_histories = []
-
-        # Rows are read as dicts keyed by the exact column names, since
-        # itertuples() renames columns that are not valid Python identifiers
-        # (e.g. "hpo-mapping") and they could then not be looked up.
-        for row in df.to_dict(orient="records"):
-            history = []
-
-            # Extract system prompt, which always opens the history
-            system_val = row.get(systemColumn)
-            if Model._hasText(system_val):
-                history.append({
-                    messageRoleElement: systemRole,
-                    messageTextElement: str(system_val)
-                })
-
-            # Empty cells stand both for missing answers and for the turns
-            # a shorter history does not have. Prompts may be empty
-            # themselves, though (e.g. a template filled with ""), so every
-            # turn up to the last one with any text is restored with its
-            # prompt; skipping an empty prompt would leave its answer
-            # without a question.
-            last_turn = max(
-                (
-                    turn for turn, (prompt_col, ans_col) in enumerate(column_pairs)
-                    if Model._hasText(row.get(prompt_col)) or Model._hasText(row.get(ans_col))
-                ),
-                default=-1
-            )
-
-            for prompt_col, ans_col in column_pairs[:last_turn + 1]:
-                # Extract prompt text (User)
-                prompt_val = row.get(prompt_col)
-                history.append({
-                    messageRoleElement: userRole,
-                    messageTextElement: str(prompt_val) if pd.notna(prompt_val) else ""
-                })
-
-                # Extract answer text (Model), with its reasoning if any
-                ans_val = row.get(ans_col)
-                if Model._hasText(ans_val):
-                    message = {
-                        messageRoleElement: modelRole,
-                        messageTextElement: str(ans_val).strip()
-                    }
-                    reasoning = row.get(prompt_col + reasoningColumnSuffix)
-                    if Model._hasText(reasoning):
-                        message[messageReasoningElement] = str(reasoning)
-                    if row.get(prompt_col + truncatedColumnSuffix) == "true":
-                        message[messageTruncatedElement] = True
-                    history.append(message)
-
-            # Rows without any text are kept as empty histories, so the
-            # indices of all later histories stay the same
-            new_message_histories.append(history)
-
-        # 4. Assign reconstructed histories back to model state. From now
-        # on this instance owns the checkpoint and may overwrite it.
-        self.messageHistories = new_message_histories
-        self.checkpointStamp = (target_file, fileStamp(target_file))
-        l.log(f"Successfully imported {len(self.messageHistories)} message histories.")
-
-        return len(self.messageHistories)
-
-    @staticmethod
-    def _hasText(value) -> bool:
-        """Returns whether a checkpoint cell holds more than whitespace."""
-        return pd.notna(value) and str(value).strip() != ""
+        :raises ValueError: If the file was written with other settings (see
+            _answerSettings()).
+        """
+        if self.store is None or self.store.path != self._checkpointPath():
+            store = AnswerStore(self._checkpointPath(), self._answerSettings())
+            store.load()
+            self.store = store
+        return self.store
 
     def toJSON(self, index: int) -> Optional[dict | list]:
         """
@@ -1246,6 +1108,121 @@ class Model:
             l.log(f"Could not locate a valid JSON object at index {index}.")
             return None
 
+    def getModelName(self) -> Optional[str]:
+        """
+        Returns the name of the loaded model: its ID in config.model_id
+        without the organisation, e.g. "medgemma-4b-it" for
+        "google/medgemma-4b-it" (the last part of a local path). The full ID
+        is self.model.
+
+        :return: The model name, or None if no model is loaded.
+        """
+        if self.model is None:
+            return None
+        return self.model.rstrip("/").rsplit("/", 1)[-1]
+
+    @staticmethod
+    def getModelCount(
+        config: str | os.PathLike | dict | ModelConfig = standard_directory,
+    ) -> int:
+        """
+        Returns the number of models in config.model_id without loading one,
+        e.g. to load every model in turn with Model(config, index).
+
+        :param config: The settings, as for Model(): a YAML configuration
+            file with an "llm" section, a dict or a ModelConfig.
+        :return: The number of configured models.
+        :raises FileNotFoundError: If the config file does not exist.
+        :raises KeyError: If the config file has no "llm" section.
+        :raises pydantic.ValidationError: If the llm settings are invalid.
+        """
+        return len(Model._resolveConfig(config)[0].model_id)
+
+    def getTurnCount(self, index: int = 0) -> int:
+        """
+        Returns the number of user prompts (turns) of a history; histories
+        built with addPrompt() or addPromptFromFile() all have the same.
+
+        :param index: Index of the history within messageHistories.
+        :return: Number of turns, 0 if there are no histories.
+        :raises IndexError: If there are histories but `index` is out of range.
+        """
+        if len(self.messageHistories) == 0:
+            return 0
+        return sum(1 for message in self._history(index) if message[messageRoleElement] == userRole)
+
+    def _turnPosition(self, index: int, turn: int) -> int:
+        """
+        Position of the user prompt of `turn` (counted from 0) within the
+        history at `index`.
+
+        :raises IndexError: If the history or the turn does not exist.
+        """
+        history = self._history(index)
+        positions = [
+            position for position, message in enumerate(history)
+            if message[messageRoleElement] == userRole
+        ]
+        if not (0 <= turn < len(positions)):
+            raise IndexError(f"Turn {turn} out of range for history {index} ({len(positions)} turns).")
+        return positions[turn]
+
+    def getPrompt(self, index: int, turn: int) -> str:
+        """
+        Returns the user prompt of a turn of a history.
+
+        :param index: Index of the history within messageHistories.
+        :param turn: Turn within the history, counted from 0.
+        :return: The prompt text.
+        :raises IndexError: If the history or the turn does not exist.
+        """
+        return str(self._history(index)[self._turnPosition(index, turn)][messageTextElement])
+
+    def getAnswer(self, index: int, turn: int) -> str:
+        """
+        Returns the answer of the model to a turn of a history, without the
+        reasoning of thinking models.
+
+        :param index: Index of the history within messageHistories.
+        :param turn: Turn within the history, counted from 0.
+        :return: The answer text, "" if the turn has no answer (yet), e.g.
+            because its prompt is longer than config.max_model_len.
+        :raises IndexError: If the history or the turn does not exist.
+        """
+        history = self._history(index)
+        position = self._turnPosition(index, turn) + 1
+        if position >= len(history) or history[position][messageRoleElement] != modelRole:
+            return ""
+        return str(history[position][messageTextElement]).strip()
+
+    def addPromptsFromFile(self, index: int, values: list[dict]) -> int:
+        """
+        Adds the prompt template at `index` of config.prompt_files to the
+        histories and fills in its {placeholders} with one dict of values per
+        history (see addPromptFromFile() and formatPromptFromFile()). Without
+        histories, one history is created per dict.
+
+        :param index: Index of the template in config.prompt_files.
+        :param values: One dict of placeholder values per history.
+        :return: Number of active message histories.
+        :raises ValueError: If `values` is empty, or if there are histories
+            and `values` does not have one dict per history.
+        :raises IndexError: If `index` is out of range for config.prompt_files.
+        :raises KeyError: If a dict has no value for a placeholder.
+        """
+        if len(values) == 0:
+            raise ValueError("No values given: one dict per history is needed.")
+        if len(self.messageHistories) > 0 and len(values) != len(self.messageHistories):
+            raise ValueError(
+                f"{len(values)} dicts of values for {len(self.messageHistories)} histories; "
+                f"one dict per history is needed."
+            )
+
+        ret = self.addPromptFromFile(index, len(values))
+        for history_index, history_values in enumerate(values):
+            self.formatPromptFromFile(history_index, history_values)
+        return ret
+
     def getMessageHistories(self) -> list[list[dict]]:
         """
         Returns all current conversation history records.
@@ -1262,15 +1239,11 @@ class Model:
 
     def logPrompts(self) -> None:
         """
-        Writes every message of every history to the prompt log
-        (config.prompt_log_folder / config.prompt_log_file), overwriting it;
+        Writes every message of every history to the prompt log (see
+        _promptLogPath()), overwriting it;
         see writePrompt(). The reasoning of thinking models is not logged.
         """
-        path = os.path.join(
-            self.config.prompt_log_folder, 
-            self.config.prompt_log_file
-        )
-        writePrompt(path, self.messageHistories)
+        writePrompt(self._promptLogPath(), self.messageHistories)
 
     def close(self) -> None:
         """

@@ -180,11 +180,12 @@ class ModelConfig(BaseModel):
         description="Ordered sequence of prompt template filenames."
     )
 
-    # Checkpoint file holding all histories, written after every generation
-    # chunk and read back by Model.importHistoriesFromFile() to resume a run.
+    # The answer store (the checkpoint): the prompts and answers in a JSON
+    # file, written after every generation chunk and used by generate() (see
+    # AnswerStore); the model name and the postfix are added to its name.
     prompt_tmp_file: str = Field(
-        default="raw.tmp",
-        description="Filename of the generation checkpoint."
+        default="answers.json",
+        description="Filename of the answer store (a JSON file)."
     )
 
     # Directory where the checkpoint file is stored.

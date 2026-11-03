@@ -221,5 +221,7 @@ __marimo__/
 data/logs/*.json
 *.lock
 
-# Generation checkpoints (see data/tmp/README.md)
+# Answer stores (see data/tmp/README.md), and the temporary files of the
+# atomic writes
+data/tmp/*.json
 *.tmp

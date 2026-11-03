@@ -19,9 +19,10 @@ from model            import (
 import model as model_package
 from model.ModelUtils import (
     systemRole, userRole, modelRole, writePrompt, writeJSON, modelRevision, packageVersions,
-    updateRunRecord, writeCheckpointCSV, messageTruncatedElement,
+    updateRunRecord, messageTruncatedElement,
 )
 import model.ModelUtils as model_utils
+import logger.FileUtils as logger_file_utils
 from conftest import REPO_ROOT
 
 # The Model module itself (not the class re-exported as `model.Model`), for
@@ -60,7 +61,7 @@ def bare_model(model_config_data, tmp_path) -> Model:
     engine loaded.
 
     Model.__init__ requires a real GPU, so tests that only exercise history
-    management (addPrompt, export/import, toJSON, ...) construct the object
+    management (addPrompt, toJSON, the answer store, ...) construct the object
     via __new__ (bypassing __init__) and set up just the state those methods
     rely on -- config, messageHistories and the run metadata fields, with
     llm left as None. Tests of generate() assign a FakeLLM.
@@ -81,7 +82,10 @@ def bare_model(model_config_data, tmp_path) -> Model:
     model.modelIndex = 0
     model.gpuCount = 0
     model.generationStats = []
-    model.checkpointStamp = None
+    model.store = None
+    model.revision = None
+    model.revisionLooked = False
+    model.postfix = ""
     return model
 
 
@@ -95,21 +99,12 @@ def logged(monkeypatch) -> list[str]:
 
 def _checkpoint_path(model: Model) -> pathlib.Path:
     """Path of the checkpoint file of `model`."""
-    return pathlib.Path(model.config.prompt_tmp_folder) / model.config.prompt_tmp_file
+    return pathlib.Path(model._checkpointPath())
 
 
 def _metadata_path(model: Model) -> str:
     """Path of the run metadata file of `model`."""
     return os.path.join(model.config.metadata_folder, model.config.metadata_file)
-
-
-def _assert_round_trip(model: Model) -> None:
-    """Writes the histories to the checkpoint, reads them back and checks that nothing changed."""
-    expected = [list(history) for history in model.messageHistories]
-    model.exportHistoriesToFile()
-    model.messageHistories = []
-    model.importHistoriesFromFile()
-    assert model.messageHistories == expected
 
 
 class FakeTokenizer:
@@ -671,148 +666,6 @@ class TestFormatPromptFromFile:
             bare_model.formatPromptFromFile(index=5, values={})
 
 
-# --- Model._get_column_names ----------------------------------------------------
-
-class TestGetColumnNames:
-
-    def test_uses_prompt_file_stem_when_available(self, bare_model):
-        bare_model.config.prompt_files = ["hpo_mapping.md", "sct_mapping.md"]
-
-        assert bare_model._get_column_names(0) == ("hpo_mapping", "hpo_mapping_answer")
-        assert bare_model._get_column_names(1) == ("sct_mapping", "sct_mapping_answer")
-
-    def test_falls_back_to_generic_name_beyond_configured_files(self, bare_model):
-        bare_model.config.prompt_files = ["hpo_mapping.md"]
-
-        assert bare_model._get_column_names(1) == ("prompt2", "prompt2_answer")
-
-
-# --- Model.exportHistoriesToFile / importHistoriesFromFile ----------------------
-
-class TestExportImportHistoriesRoundTrip:
-
-    def test_round_trip_preserves_prompt_and_answer_pairs(self, tmp_path, bare_model):
-
-        bare_model.addPrompt(userRole, ["What is the capital of France?"])
-        bare_model.addPrompt(modelRole, ["Paris"])
-
-        written = bare_model.exportHistoriesToFile()
-        assert written == 1
-
-        bare_model.messageHistories = []
-        imported = bare_model.importHistoriesFromFile()
-
-        assert imported == 1
-        assert bare_model.messageHistories[0] == [
-            {messageRoleElement: userRole, messageTextElement: "What is the capital of France?"},
-            {messageRoleElement: modelRole, messageTextElement: "Paris"},
-        ]
-
-    def test_round_trip_keeps_answers_that_look_like_missing_or_numbers(self, tmp_path, bare_model):
-
-        bare_model.addPrompt(userRole, ["q1", "q2", "q3"])
-        bare_model.addPrompt(modelRole, ["NA", "None", "1"])
-        _assert_round_trip(bare_model)
-
-    def test_round_trip_preserves_system_role(self, tmp_path, bare_model):
-
-        bare_model.addPrompt(systemRole, ["You are concise."])
-        bare_model.addPrompt(userRole, ["Question"])
-        bare_model.addPrompt(modelRole, ["Answer"])
-        _assert_round_trip(bare_model)
-
-    def test_round_trip_with_non_identifier_prompt_file_name(self, tmp_path, bare_model):
-        bare_model.config.prompt_files = ["01_hpo-mapping.md"]
-
-        bare_model.addPrompt(userRole, ["Question"])
-        bare_model.addPrompt(modelRole, ["Answer"])
-        expected = [list(history) for history in bare_model.messageHistories]
-
-        bare_model.exportHistoriesToFile()
-        bare_model.messageHistories = []
-
-        assert bare_model.importHistoriesFromFile() == 1
-        assert bare_model.messageHistories == expected
-
-    def test_export_leaves_no_temporary_file(self, tmp_path, bare_model):
-
-        bare_model.addPrompt(userRole, ["Question"])
-        bare_model.exportHistoriesToFile()
-
-        assert os.listdir(_checkpoint_path(bare_model).parent) == ["raw.tmp"]
-
-    def test_export_with_no_histories_raises(self, bare_model):
-        with pytest.raises(ValueError):
-            bare_model.exportHistoriesToFile()
-
-    def test_import_with_missing_file_raises(self, tmp_path, bare_model):
-
-        with pytest.raises(FileNotFoundError):
-            bare_model.importHistoriesFromFile()
-
-    def test_import_with_empty_file_raises(self, tmp_path, bare_model):
-        _checkpoint_path(bare_model).parent.mkdir()
-        _checkpoint_path(bare_model).write_text("", encoding="utf-8")
-
-        with pytest.raises(ValueError):
-            bare_model.importHistoriesFromFile()
-
-
-    def test_round_trip_of_multi_turn_histories_of_different_lengths(self, tmp_path, bare_model):
-        bare_model.messageHistories = [
-            [
-                {messageRoleElement: userRole, messageTextElement: "q1"},
-                {messageRoleElement: modelRole, messageTextElement: "a1"},
-                {messageRoleElement: userRole, messageTextElement: "q2"},
-                {messageRoleElement: modelRole, messageTextElement: "a2"},
-            ],
-            [
-                {messageRoleElement: userRole, messageTextElement: "q1"},
-                {messageRoleElement: modelRole, messageTextElement: "a1"},
-            ],
-        ]
-        expected = [list(history) for history in bare_model.messageHistories]
-
-        bare_model.exportHistoriesToFile()
-        header = _checkpoint_path(bare_model).read_text(encoding="utf-8").splitlines()[0]
-        assert header == '"_model";"prompt_a";"prompt_a_answer";"prompt_b";"prompt_b_answer"'
-
-        bare_model.messageHistories = []
-        bare_model.importHistoriesFromFile()
-
-        assert bare_model.messageHistories == expected
-
-    def test_consecutive_user_prompts_get_their_own_columns(self, tmp_path, bare_model):
-        bare_model.addPrompt(userRole, ["first"])
-        bare_model.addPrompt(userRole, ["second"])
-        _assert_round_trip(bare_model)
-
-    def test_round_trip_keeps_empty_prompts_and_history_indices(self, tmp_path, bare_model):
-        # An empty prompt used to be dropped, leaving its answer without a
-        # question, and a row without text used to be dropped entirely
-        bare_model.messageHistories = [
-            [
-                {messageRoleElement: userRole, messageTextElement: "  "},
-                {messageRoleElement: modelRole, messageTextElement: "a1"},
-            ],
-            [],
-            [
-                {messageRoleElement: userRole, messageTextElement: "q"},
-                {messageRoleElement: modelRole, messageTextElement: "a3"},
-            ],
-        ]
-        _assert_round_trip(bare_model)
-        assert bare_model.toJSON(1) is None
-
-    def test_import_without_prompt_columns_raises(self, tmp_path, bare_model):
-        # E.g. a checkpoint written with other prompt_files
-        _checkpoint_path(bare_model).parent.mkdir()
-        _checkpoint_path(bare_model).write_text('"other";"other_answer"\n"q";"a"\n', encoding="utf-8")
-
-        with pytest.raises(ValueError, match="no prompt/answer columns"):
-            bare_model.importHistoriesFromFile()
-
-
 # --- Model.toJSON ----------------------------------------------------------------
 
 class TestToJSON:
@@ -891,6 +744,183 @@ class TestResetAndGetMessageHistories:
         bare_model.reset()
 
         assert bare_model.getMessageHistories() == []
+
+
+# --- Model.getModelName ---------------------------------------------------------------
+
+class TestGetModelName:
+
+    @pytest.mark.parametrize("model_id, name", [
+        ("google/medgemma-4b-it", "medgemma-4b-it"),
+        ("Qwen3-4B", "Qwen3-4B"),
+        ("/models/org/Mistral-7B/", "Mistral-7B"),
+    ])
+    def test_returns_the_id_without_the_organisation(self, bare_model, model_id, name):
+        bare_model.model = model_id
+
+        assert bare_model.getModelName() == name
+
+    def test_returns_none_without_a_model(self, bare_model):
+        bare_model.model = None
+
+        assert bare_model.getModelName() is None
+
+
+# --- Model.getModelCount --------------------------------------------------------------
+
+class TestGetModelCount:
+
+    def test_counts_the_models_of_a_config_file(self, tmp_path, model_config_data):
+        path = _write_yaml_config(tmp_path, model_config_data)
+
+        assert Model.getModelCount(path) == 2
+
+    def test_accepts_a_dict_and_a_model_config(self, model_config_data):
+        model_config_data["model_id"] = ["a/one", "b/two", "c/three"]
+
+        assert Model.getModelCount(model_config_data) == 3
+        assert Model.getModelCount({"llm": model_config_data}) == 3
+        assert Model.getModelCount(ModelConfig.model_validate(model_config_data)) == 3
+
+    def test_loads_no_model(self, model_config_data, monkeypatch):
+        monkeypatch.setattr(Model, "__init__", lambda *args, **kwargs: pytest.fail("Model loaded"))
+
+        assert Model.getModelCount(model_config_data) == 2
+
+    def test_missing_config_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            Model.getModelCount(str(tmp_path / "missing.yaml"))
+
+
+# --- Model.setPostfix / hasCheckpoint ------------------------------------------------
+
+class TestFileNames:
+
+    def test_file_names_contain_the_model_name(self, bare_model):
+        assert os.path.basename(bare_model._checkpointPath()) == "raw_model-a.tmp"
+        assert os.path.basename(bare_model._promptLogPath()) == "prompts_model-a.log"
+
+    def test_postfix_follows_the_model_name(self, bare_model):
+        bare_model.setPostfix("Test_FewShot")
+
+        assert os.path.basename(bare_model._checkpointPath()) == "raw_model-a_Test_FewShot.tmp"
+        assert os.path.basename(bare_model._promptLogPath()) == "prompts_model-a_Test_FewShot.log"
+
+    def test_empty_postfix_removes_it(self, bare_model):
+        bare_model.setPostfix("x")
+        bare_model.setPostfix("")
+
+        assert os.path.basename(bare_model._checkpointPath()) == "raw_model-a.tmp"
+
+    @pytest.mark.parametrize("postfix", ["a/b", "../x"])
+    def test_postfix_with_a_path_separator_raises(self, bare_model, postfix):
+        with pytest.raises(ValueError, match="path separator"):
+            bare_model.setPostfix(postfix)
+
+    def test_has_checkpoint_follows_the_postfix(self, bare_model):
+        assert not bare_model.hasCheckpoint()
+
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        assert bare_model.hasCheckpoint()
+        bare_model.setPostfix("other")
+        assert not bare_model.hasCheckpoint()
+
+    def test_runs_with_other_postfixes_do_not_share_a_checkpoint(self, bare_model, tmp_path):
+        bare_model.llm = FakeLLM()
+        bare_model.setPostfix("first")
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        bare_model.reset()
+        bare_model.setPostfix("second")
+        bare_model.addPrompt(userRole, ["q"])
+
+        # The answer of the first postfix is not used
+        assert bare_model.generate() == 1
+
+        stores = sorted(name for name in os.listdir(tmp_path / "tmp") if name.endswith(".tmp"))
+        assert stores == ["raw_model-a_first.tmp", "raw_model-a_second.tmp"]
+
+    def test_run_metadata_records_the_file_names(self, bare_model):
+        bare_model.setPostfix("Test")
+        bare_model._writeRunMetadata()
+
+        runs = json.loads(open(_metadata_path(bare_model), encoding="utf-8").read())
+        assert runs[-1]["files"] == {
+            "checkpoint": bare_model._checkpointPath(),
+            "prompt_log": bare_model._promptLogPath(),
+        }
+
+
+# --- Model.getTurnCount / getPrompt / getAnswer --------------------------------------
+
+class TestTurns:
+
+    def test_turn_count_without_histories_is_zero(self, bare_model):
+        assert bare_model.getTurnCount() == 0
+
+    def test_prompts_and_answers_by_turn(self, bare_model):
+        bare_model.addPrompt(systemRole, ["system"])
+        bare_model.addPrompt(userRole, ["q1"])
+        bare_model.addPrompt(modelRole, ["  a1 "])
+        bare_model.addPrompt(userRole, ["q2"])
+
+        assert bare_model.getTurnCount(0) == 2
+        assert bare_model.getPrompt(0, 0) == "q1"
+        assert bare_model.getPrompt(0, 1) == "q2"
+        assert bare_model.getAnswer(0, 0) == "a1"
+        # Not answered yet
+        assert bare_model.getAnswer(0, 1) == ""
+
+    def test_unknown_turn_or_history_raises(self, bare_model):
+        bare_model.addPrompt(userRole, ["q1"])
+
+        with pytest.raises(IndexError, match="Turn 1"):
+            bare_model.getPrompt(0, 1)
+        with pytest.raises(IndexError):
+            bare_model.getAnswer(5, 0)
+        with pytest.raises(IndexError):
+            bare_model.getTurnCount(5)
+
+
+# --- Model.addPromptsFromFile ---------------------------------------------------------
+
+class TestAddPromptsFromFile:
+
+    @pytest.fixture
+    def templated_model(self, bare_model, tmp_path):
+        (tmp_path / "first.md").write_text("Label: {label}", encoding="utf-8")
+        (tmp_path / "second.md").write_text("Synonym: {synonym}", encoding="utf-8")
+        bare_model.config.prompt_folder = str(tmp_path)
+        bare_model.config.prompt_files = ["first.md", "second.md"]
+        return bare_model
+
+    def test_creates_and_fills_one_history_per_dict(self, templated_model):
+        values = [{"label": "A", "synonym": "a"}, {"label": "B", "synonym": "b"}]
+
+        assert templated_model.addPromptsFromFile(0, values) == 2
+        templated_model.addPrompt(modelRole, ["x", "y"])
+        assert templated_model.addPromptsFromFile(1, values) == 2
+
+        assert [templated_model.getPrompt(i, 0) for i in range(2)] == ["Label: A", "Label: B"]
+        assert [templated_model.getPrompt(i, 1) for i in range(2)] == ["Synonym: a", "Synonym: b"]
+
+    def test_needs_one_dict_per_history(self, templated_model):
+        templated_model.addPromptsFromFile(0, [{"label": "A"}, {"label": "B"}])
+
+        with pytest.raises(ValueError, match="one dict per history"):
+            templated_model.addPromptsFromFile(1, [{"synonym": "a"}])
+
+    def test_empty_values_raise(self, templated_model):
+        with pytest.raises(ValueError, match="No values"):
+            templated_model.addPromptsFromFile(0, [])
+
+    def test_missing_placeholder_raises(self, templated_model):
+        with pytest.raises(KeyError):
+            templated_model.addPromptsFromFile(0, [{"synonym": "a"}])
 
 
 # --- Model.generate ------------------------------------------------------------------
@@ -981,15 +1011,17 @@ class TestGenerateResumeAndTurns:
         with pytest.raises(RuntimeError, match="job killed"):
             bare_model.generate()
 
-        # A new run loads the checkpoint of the first chunk ...
-        bare_model.reset()
-        bare_model.importHistoriesFromFile()
-        assert [len(history) for history in bare_model.messageHistories] == [2, 2, 1, 1]
+        # A new run with the same prompts uses the answers stored after the
+        # first chunk ...
+        new_run = Model.__new__(Model)
+        new_run.__dict__.update(bare_model.__dict__, store=None, messageHistories=[])
+        new_run.addPrompt(userRole, ["a", "b", "c", "d"])
+        new_run.llm = FakeLLM()
 
         # ... and only generates the histories without an answer
-        bare_model.llm = FakeLLM()
-        assert bare_model.generate() == 2
-        assert bare_model.llm.batches == [2]
+        assert new_run.generate() == 2
+        assert new_run.llm.batches == [2]
+        bare_model = new_run
         assert [history[-1][messageTextElement] for history in bare_model.messageHistories] == [
             "answer to a", "answer to b", "answer to c", "answer to d"
         ]
@@ -1065,56 +1097,40 @@ class TestConcurrentRuns:
     other's work.
     """
 
-    def test_generate_refuses_a_checkpoint_it_did_not_import(self, bare_model):
-        bare_model.addPrompt(userRole, ["q"])
-        bare_model.exportHistoriesToFile()
+    def test_runs_sharing_a_store_keep_each_others_answers(self, bare_model):
+        bare_model.llm = FakeLLM()
         other_run = Model.__new__(Model)
-        other_run.__dict__.update(bare_model.__dict__, checkpointStamp=None, messageHistories=[])
-        other_run.addPrompt(userRole, ["other q"])
+        other_run.__dict__.update(bare_model.__dict__, store=None, messageHistories=[])
+        other_run.llm = FakeLLM()
+        # Both load the (empty) store before either writes it
+        bare_model._answerStore()
+        other_run._answerStore()
+
+        bare_model.addPrompt(userRole, ["a"])
+        bare_model.generate()
+        other_run.addPrompt(userRole, ["b"])
+        other_run.generate()
+
+        stored = json.loads(_checkpoint_path(bare_model).read_text(encoding="utf-8"))
+        assert sorted(node["prompt"] for node in stored["histories"].values()) == ["a", "b"]
+
+    def test_a_store_of_another_model_is_refused(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+        # Another organisation's model of the same name has the same file name
+        other_run = Model.__new__(Model)
+        other_run.__dict__.update(bare_model.__dict__, store=None, messageHistories=[], model="other-org/model-a")
+        other_run.addPrompt(userRole, ["q"])
         other_run.llm = FakeLLM()
 
-        with pytest.raises(RuntimeError, match="was not imported by this run"):
+        with pytest.raises(ValueError, match="model: 'dummy/model-a' -> 'other-org/model-a'"):
             other_run.generate()
         # Refused before anything was generated
         assert other_run.llm.batches == []
 
-    def test_export_detects_a_checkpoint_changed_by_another_run(self, bare_model):
-        bare_model.addPrompt(userRole, ["q"])
-        bare_model.exportHistoriesToFile()
-        path = str(_checkpoint_path(bare_model))
-        writeCheckpointCSV(model_module.pd.DataFrame([{"_model": "other", "prompt_a": "x"}]), path)
-
-        with pytest.raises(RuntimeError, match="was changed by another run"):
-            bare_model.exportHistoriesToFile()
-
-    def test_resumed_run_may_overwrite_the_checkpoint(self, bare_model):
-        bare_model.addPrompt(userRole, ["a", "b"])
-        bare_model.exportHistoriesToFile()
-        resumed = Model.__new__(Model)
-        resumed.__dict__.update(bare_model.__dict__, checkpointStamp=None, messageHistories=[])
-        resumed.llm = FakeLLM()
-
-        resumed.importHistoriesFromFile()
-
-        assert resumed.generate() == 2
-
-    def test_a_checkpoint_of_another_model_is_not_resumed(self, bare_model):
-        bare_model.addPrompt(userRole, ["q"])
-        bare_model.exportHistoriesToFile()
-        bare_model.model = "dummy/model-b"
-
-        with pytest.raises(ValueError, match="written with model \\['dummy/model-a'\\]"):
-            bare_model.importHistoriesFromFile()
-
-    def test_a_checkpoint_without_model_column_is_accepted(self, bare_model):
-        # Written by a version before the "_model" column
-        path = str(_checkpoint_path(bare_model))
-        writeCheckpointCSV(model_module.pd.DataFrame([{"prompt_a": "q", "prompt_a_answer": "a"}]), path)
-
-        assert bare_model.importHistoriesFromFile() == 1
-
     @pytest.mark.skipif(
-        model_utils.fcntl is None or "fork" not in multiprocessing.get_all_start_methods(),
+        logger_file_utils.fcntl is None or "fork" not in multiprocessing.get_all_start_methods(),
         reason="needs file locks and fork",
     )
     def test_concurrent_metadata_updates_keep_every_record(self, tmp_path):
@@ -1129,6 +1145,233 @@ class TestConcurrentRuns:
         runs = json.loads(open(path, encoding="utf-8").read())
         assert len(runs) == 100
         assert all(process.exitcode == 0 for process in workers)
+
+
+def _stored(model: Model) -> dict:
+    """The content of the answer store file of `model`."""
+    return json.loads(_checkpoint_path(model).read_text(encoding="utf-8"))
+
+
+def _new_run(model: Model, **changes) -> Model:
+    """A second Model with the settings of `model`, no histories and no loaded store."""
+    run = Model.__new__(Model)
+    run.__dict__.update(model.__dict__, store=None, messageHistories=[], **changes)
+    run.config = model.config.model_copy(deep=True)
+    run.llm = FakeLLM()
+    return run
+
+
+class TestAnswerStore:
+    """The prompts and answers in the JSON answer store (src/AnswerStore.py)."""
+
+    def test_stores_settings_and_a_tree_by_turn(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(systemRole, ["system"])
+        bare_model.addPrompt(userRole, ["first"])
+        bare_model.generate()
+        bare_model.addPrompt(userRole, ["second"])
+        bare_model.generate()
+
+        stored = _stored(bare_model)
+        assert stored["format"] == 1
+        assert stored["settings"]["model"] == "dummy/model-a"
+        assert stored["settings"]["seed"] == bare_model.config.seed
+        (system,) = stored["histories"].values()
+        assert system["role"] == "system" and "answer" not in system
+        (first,) = system["next"].values()
+        assert first["prompt"] == "first" and first["answer"] == {"text": "answer to first"}
+        (second,) = first["next"].values()
+        assert second["answer"] == {"text": "answer to second"}
+        assert list(system["next"]) == [model_package.AnswerStore.promptKeyOf("first")]
+
+    def test_a_shared_first_turn_is_generated_once(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["concept"] * 3)
+        bare_model.generate()
+        bare_model.addPrompt(userRole, ["synonym a", "synonym b", "synonym c"])
+        bare_model.generate()
+
+        assert bare_model.llm.batches == [1, 3]
+        assert [bare_model.getAnswer(i, 0) for i in range(3)] == ["answer to concept"] * 3
+        (concept,) = _stored(bare_model)["histories"].values()
+        assert len(concept["next"]) == 3
+
+    def test_identical_histories_get_the_same_answer(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q", "r", "q"])
+
+        assert bare_model.generate() == 2
+        assert [bare_model.getAnswer(i, 0) for i in range(3)] == ["answer to q", "answer to r", "answer to q"]
+        assert bare_model.generationStats[-1]["shared"] == 1
+
+    def test_stored_answers_are_used_instead_of_generated(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["a", "b"])
+        bare_model.generate()
+
+        run = _new_run(bare_model)
+        run.addPrompt(userRole, ["b", "c", "a"])
+
+        assert run.generate() == 1
+        assert run.llm.batches == [1]
+        assert [run.getAnswer(i, 0) for i in range(3)] == ["answer to b", "answer to c", "answer to a"]
+        assert run.generationStats[-1]["stored"] == 2
+
+    def test_a_stored_answer_needs_the_same_earlier_answers(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["first"])
+        bare_model.generate()
+        bare_model.addPrompt(userRole, ["second"])
+        bare_model.generate()
+
+        # The same prompts, but another answer to the first one
+        run = _new_run(bare_model)
+        run.addPrompt(userRole, ["first"])
+        run.addPrompt(modelRole, ["another answer"])
+        run.addPrompt(userRole, ["second"])
+
+        assert run.generate() == 1
+
+    def test_answers_can_be_used_after_close(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        run = _new_run(bare_model)
+        run.llm = None
+        run.addPrompt(userRole, ["q"])
+
+        assert run.generate() == 0
+        assert run.getAnswer(0, 0) == "answer to q"
+
+    def test_empty_answers_are_not_stored(self, bare_model):
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(userRole, ["long question"])
+        bare_model.generate()
+        assert bare_model.getAnswer(0, 0) == ""
+
+        (node,) = _stored(bare_model)["histories"].values()
+        assert "answer" not in node
+
+    def test_skipped_histories_and_their_copies_are_not_stored(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.config.max_model_len = 10
+        bare_model.addPrompt(userRole, ["x" * 10, "short", "x" * 10])
+
+        assert bare_model.generate() == 1
+        assert bare_model.skippedHistories == [0, 2]
+        assert len(_stored(bare_model)["histories"]) == 1
+
+    def test_other_settings_are_refused(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        run = _new_run(bare_model)
+        run.config.temperature = 0.7
+        run.config.chunk_size = 1
+        run.addPrompt(userRole, ["q"])
+
+        with pytest.raises(ValueError, match="temperature: 0.01 -> 0.7") as error:
+            run.generate()
+        # Settings that do not change the answers may change
+        assert "chunk_size" not in str(error.value)
+        assert run.llm.batches == []
+
+    def test_an_unknown_revision_is_no_difference(self, bare_model, monkeypatch):
+        bare_model.llm = FakeLLM()
+        bare_model.revision = "abc123"
+        bare_model.revisionLooked = True
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        # E.g. the model is not in the local Hugging Face cache
+        monkeypatch.setattr(model_module, "modelRevision", lambda model_id: None)
+        run = _new_run(bare_model, revision=None, revisionLooked=False)
+        run.addPrompt(userRole, ["q"])
+
+        assert run.generate() == 0
+
+    def test_histories_are_restored_as_they_were(self, bare_model):
+        # Two turns with a system prompt, reasoning, a cut-off (empty) answer
+        # and a first turn two histories share
+        bare_model.llm = FakeThinkingLLM()
+        bare_model.addPrompt(systemRole, ["system"] * 3)
+        bare_model.addPrompt(userRole, ["concept", "concept", "other concept"])
+        bare_model.generate()
+        bare_model.addPrompt(userRole, ["synonym a", "long synonym b", "synonym c"])
+        bare_model.generate()
+        expected = [[dict(message) for message in history] for history in bare_model.messageHistories]
+
+        run = _new_run(bare_model)
+        run.llm = FakeThinkingLLM()
+        run.addPrompt(systemRole, ["system"] * 3)
+        run.addPrompt(userRole, ["concept", "concept", "other concept"])
+        assert run.generate() == 0
+        run.addPrompt(userRole, ["synonym a", "long synonym b", "synonym c"])
+        # Only the empty answer, which is not stored, is generated again
+        assert run.generate() == 1
+
+        assert run.messageHistories == expected
+        assert run.messageHistories[0][2][messageReasoningElement].startswith("The user asks concept")
+        assert run.truncatedHistories == [1]
+
+    def test_answers_of_another_run_for_a_differing_answer_are_left_out(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model._answerStore()
+        other_run = _new_run(bare_model)
+        other_run._answerStore()
+
+        # Both answer "first" differently and go on from there
+        bare_model.addPrompt(userRole, ["first"])
+        bare_model.addPrompt(modelRole, ["my answer"])
+        bare_model.addPrompt(userRole, ["second"])
+        bare_model.generate()
+        other_run.addPrompt(userRole, ["first"])
+        other_run.addPrompt(modelRole, ["other answer"])
+        other_run.addPrompt(userRole, ["second"])
+        other_run.generate()
+
+        # The run writing last keeps its answer and the turns after it; the
+        # turns generated after the other answer are not attached to it
+        (first,) = _stored(bare_model)["histories"].values()
+        assert first["answer"] == {"text": "other answer"}
+        assert len(first["next"]) == 1
+
+        def continue_after(answer: str) -> int:
+            run = _new_run(bare_model)
+            run.addPrompt(userRole, ["first"])
+            run.addPrompt(modelRole, [answer])
+            run.addPrompt(userRole, ["second"])
+            return run.generate()
+
+        assert continue_after("other answer") == 0
+        assert continue_after("my answer") == 1
+
+    def test_two_prompts_in_a_row_do_not_take_answers_after_an_answer(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["first"])
+        bare_model.generate()
+        bare_model.addPrompt(userRole, ["second"])
+        bare_model.generate()
+
+        run = _new_run(bare_model)
+        run.addPrompt(userRole, ["first"])
+        run.addPrompt(userRole, ["second"])
+
+        assert run.generate() == 1
+        sent, _ = run.llm.chat_calls[-1]
+        assert [message[messageTextElement] for message in sent[0]] == ["first", "second"]
+
+    def test_a_file_that_is_no_answer_store_is_refused(self, bare_model):
+        path = _checkpoint_path(bare_model)
+        path.parent.mkdir(parents=True)
+        path.write_text('{"something": "else"}', encoding="utf-8")
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q"])
+
+        with pytest.raises(ValueError, match="not an answer store"):
+            bare_model.generate()
 
 
 class TestCutOffAnswers:
@@ -1180,9 +1423,12 @@ class TestCutOffAnswers:
         expected = [list(history) for history in bare_model.messageHistories]
 
         bare_model.reset()
-        bare_model.importHistoriesFromFile()
+        bare_model.store = None
+        bare_model.addPrompt(userRole, ["q"])
 
+        assert bare_model.generate() == 0
         assert bare_model.messageHistories == expected
+        assert bare_model.truncatedHistories == [0]
         assert bare_model.toJSON(0) is None
 
 
@@ -1308,29 +1554,26 @@ class TestGenerateWithThinkingModels:
         )
 
     def test_checkpoint_round_trip_keeps_reasoning(self, tmp_path, bare_model):
-        bare_model.config.prompt_files = ["prompt_a.md"]
         bare_model.llm = FakeThinkingLLM()
         bare_model.addPrompt(userRole, ["q1", "q2"])
         bare_model.generate()
         expected = [list(history) for history in bare_model.messageHistories]
 
-        bare_model.exportHistoriesToFile()
-        header = open(_checkpoint_path(bare_model), encoding="utf-8").readline()
-        assert "prompt_a_reasoning" in header
+        bare_model.reset()
+        bare_model.store = None
+        bare_model.addPrompt(userRole, ["q1", "q2"])
+        bare_model.generate()
 
-        bare_model.messageHistories = []
-        bare_model.importHistoriesFromFile()
         assert bare_model.messageHistories == expected
 
-    def test_checkpoint_without_reasoning_has_no_reasoning_column(self, tmp_path, bare_model):
-        bare_model.config.prompt_files = ["prompt_a.md"]
+    def test_answer_without_reasoning_stores_none(self, tmp_path, bare_model):
+        bare_model.llm = FakeLLM()
         bare_model.addPrompt(userRole, ["q1"])
-        bare_model.addPrompt(modelRole, ["a1"])
+        bare_model.generate()
 
-        bare_model.exportHistoriesToFile()
-
-        header = open(_checkpoint_path(bare_model), encoding="utf-8").readline()
-        assert "reasoning" not in header
+        stored = json.loads(_checkpoint_path(bare_model).read_text(encoding="utf-8"))
+        (node,) = stored["histories"].values()
+        assert node["answer"] == {"text": "answer to q1"}
 
 
 # --- Model._writeRunMetadata ----------------------------------------------------------
@@ -1399,7 +1642,7 @@ class TestLogPrompts:
 
         bare_model.logPrompts()
 
-        log_path = tmp_path / "prompts.log"
+        log_path = tmp_path / "prompts_model-a.log"
         assert log_path.is_file()
         assert "Hello" in log_path.read_text(encoding="utf-8")
 

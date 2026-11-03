@@ -1,6 +1,6 @@
 # Model
 
-A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting a local LLM in batches: manages many independent conversation histories, renders them with the model's own chat template, runs chunked batched generation with on-disk checkpoints, and logs prompts to disk.
+A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting a local LLM in batches: manages many independent conversation histories, renders them with the model's own chat template, runs chunked batched generation that stores its answers on disk (resumable, and reusing earlier answers), and logs prompts to disk.
 
 ## Features
 
@@ -8,7 +8,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 - **Multi-history chat state** — track many independent conversations at once; add messages by broadcasting to all histories, one per history, or by initializing new histories.
 - **Prompt templates** — load prompt files from `prompts/` and fill their `{placeholder}` fields per history.
 - **Native chat templates** — histories are sent to vLLM's chat interface (`LLM.chat()`), which formats them with the model's own chat template, so any chat model supported by vLLM works.
-- **Chunked generation with checkpoints** — histories are generated in chunks of `chunk_size`; after every chunk all histories are written atomically to a checkpoint file, from which an interrupted run (e.g. a killed Slurm job) can resume.
+- **Chunked generation with an answer store** — histories are generated in chunks of `chunk_size`; after every chunk the prompts and answers are stored in a JSON file (keyed by the hash of each prompt, with the settings they were generated with), so an interrupted run (e.g. a killed Slurm job) resumes where it stopped and answers are never generated twice.
 - **Context-length check** — a history whose prompt does not fit into `max_model_len` is skipped (and listed in `skippedHistories`) instead of failing its whole chunk.
 - **Progress logging** — after every chunk the log shows answers and tokens generated, tokens per second, the elapsed time and the estimated remaining time.
 - **Run metadata** — package versions, the model's Hugging Face revision, GPUs, the full configuration, prompt file hashes and generation statistics are written to a JSON file for reproducibility.
@@ -30,12 +30,13 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 │   └── config.yaml      # Configuration; Model reads the "llm" section, Logger the "logger" section
 ├── data/
 │   ├── logs/            # Log output (Logger log, prompt log and run metadata)
-│   └── tmp/             # Generation checkpoints
+│   └── tmp/             # Answer stores (the checkpoints)
 ├── prompts/
 │   └── mapping.md       # Prompt template (HPO ↔ SNOMED CT mapping)
 ├── src/                 # The `model` package
 │   ├── __init__.py
-│   ├── Model.py         # Model class (chat state, prompting, generation, checkpoints, cleanup)
+│   ├── AnswerStore.py   # JSON store of the prompts and answers (the checkpoint)
+│   ├── Model.py         # Model class (chat state, prompting, generation, cleanup)
 │   ├── ModelConfig.py   # Pydantic configuration schema
 │   └── ModelUtils.py    # Role/device constants, file writers and run metadata helpers
 ├── tests/
@@ -49,7 +50,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 
 - Python 3.10+
 - A CUDA-capable GPU
-- [`vllm`](https://github.com/vllm-project/vllm) 0.9 or newer, [`torch`](https://pytorch.org/), [`pandas`](https://pandas.pydata.org/), [`pydantic`](https://docs.pydantic.dev/) 2.x, [`PyYAML`](https://pyyaml.org/) and [`logger`](https://github.com/Goldkugel/logger)
+- [`vllm`](https://github.com/vllm-project/vllm) 0.9 or newer, [`torch`](https://pytorch.org/), [`pydantic`](https://docs.pydantic.dev/) 2.x, [`PyYAML`](https://pyyaml.org/) and [`logger`](https://github.com/Goldkugel/logger)
 
 All dependencies are declared in `pyproject.toml` and installed with the package:
 
@@ -67,7 +68,7 @@ The tests do not need `vllm` and `torch`. To run them on a machine without a GPU
 
 ```bash
 pip install --no-deps -e .
-pip install "logger @ git+https://github.com/Goldkugel/logger.git@v1.1.0" pandas "pydantic>=2" pyyaml pytest
+pip install "logger @ git+https://github.com/Goldkugel/logger.git@v1.5.0" "pydantic>=2" pyyaml pytest
 ```
 
 ## Configuration
@@ -97,7 +98,7 @@ llm:
   max_tokens: 2048
   chunk_size: 500
   prompt_tmp_folder: "./data/tmp/"
-  prompt_tmp_file: "prompts_raw.tmp"
+  prompt_tmp_file: "answers.json"
   prompt_log_folder: "./data/logs/"
   prompt_log_file: "prompts.log"
   metadata_folder: "./data/logs/"
@@ -124,11 +125,11 @@ llm:
 | `reasoning_start_tag` | `str` | `"<think>"` | Marker that opens a thinking model's reasoning. |
 | `reasoning_end_tag` | `str` \| `null` | `"</think>"` | Marker that closes the reasoning; the answer is the text after its first occurrence. `null` stores the whole output as the answer. |
 | `max_tokens` | `int` | `2048` | Maximum number of generated tokens per answer, including a thinking model's reasoning. |
-| `chunk_size` | `int` | `500` | Number of histories generated before a checkpoint is written. |
-| `prompt_tmp_folder` | `str` | `"./data/tmp/"` | Directory of the checkpoint file. |
-| `prompt_tmp_file` | `str` | `"raw.tmp"` | Checkpoint file name. |
+| `chunk_size` | `int` | `500` | Number of histories generated before the answers are stored. |
+| `prompt_tmp_folder` | `str` | `"./data/tmp/"` | Directory of the answer store (the checkpoint). |
+| `prompt_tmp_file` | `str` | `"answers.json"` | File name of the answer store, a JSON file (e.g. `answers.json`); the model name and the postfix (`setPostfix()`) are added, e.g. `answers_medgemma-4b-it.json`. |
 | `prompt_log_folder` | `str` | `"./data/logs/"` | Directory `logPrompts()` writes to. |
-| `prompt_log_file` | `str` | `"prompts.log"` | File name `logPrompts()` writes to. |
+| `prompt_log_file` | `str` | `"prompts.log"` | File name `logPrompts()` writes to; named like the checkpoint, e.g. `prompts_medgemma-4b-it.log`. |
 | `metadata_folder` | `str` | `"./data/logs/"` | Directory of the run metadata file. |
 | `metadata_file` | `str` | `"run_metadata.json"` | Run metadata file name (see [Run metadata](#run-metadata)). |
 | `prompt_folder` | `str` | `"./prompts/"` | Directory of the prompt template files. |
@@ -160,6 +161,8 @@ with Model("./config/config.yaml", index=0) as model:
     # ... and fill each history's {placeholders}.
     for i, values in enumerate(concepts):
         model.formatPromptFromFile(i, values)
+    # (Both steps at once, with one dict of values per history:
+    # model.addPromptsFromFile(0, concepts).)
 
     # Generate an answer for every history that has none yet.
     model.generate()
@@ -169,7 +172,22 @@ with Model("./config/config.yaml", index=0) as model:
     for i in range(len(concepts)):
         print(model.toJSON(i))
 
+    # Prompts and answers by turn (counted from 0); "" for an unanswered turn.
+    print(model.getTurnCount(0), model.getPrompt(0, 0), model.getAnswer(0, 0))
+
     model.logPrompts()
+
+    # "medgemma-4b-it" for "google/medgemma-4b-it", e.g. for file names;
+    # the full ID is model.model.
+    print(model.getModelName())
+```
+
+`Model.getModelCount(config)` returns the number of models in `model_id` without loading one, e.g. to run every configured model in turn:
+
+```python
+for index in range(Model.getModelCount("./config/config.yaml")):
+    with Model("./config/config.yaml", index=index) as model:
+        ...
 ```
 
 Messages can also be added directly. A single-item list is broadcast to every history; a list with one item per history is added one-to-one; on empty histories, one new history is created per item. The role must be `"system"`, `"user"` or `"assistant"`, and `message` must be a list, even for a single message:
@@ -219,28 +237,48 @@ answer["reasoning"]   # the reasoning (key missing for non-thinking answers)
 
 **Settings.** For hybrid models such as Qwen3, `enable_thinking: false` switches thinking off and `true` switches it on; the setting is passed both to `LLM.chat()` and to the context-length check. Reasoning counts towards `max_tokens`, so thinking models need a much larger value (e.g. 8192–32768) and a `max_model_len` that fits prompt plus output. Most model cards also recommend `temperature: 0.6` and `top_p: 0.95` instead of near-greedy decoding, which tends to make the reasoning repeat itself.
 
-**Cut-off answers.** Every answer that stopped at `max_tokens` is listed in `model.truncatedHistories` and in the run metadata. A thinking model cut off during its reasoning gets an empty answer (`toJSON()` returns `None`); the next `generate()` call, also after resuming from the checkpoint, replaces it by a new answer. With the same seed and settings the new answer is cut off again, so raise `max_tokens` first. Until then, `addPrompt()` refuses to add another turn to such a history, since the checkpoint cannot store the empty answer between two prompts. With DeepSeek-R1-style templates, which open the reasoning in the prompt, an output cut off before `</think>` contains no tag at all; it is recognised from the template and also stored as reasoning with an empty answer.
+**Cut-off answers.** Every answer that stopped at `max_tokens` is listed in `model.truncatedHistories` and in the run metadata. A thinking model cut off during its reasoning gets an empty answer (`toJSON()` returns `None`); the next `generate()` call replaces it by a new answer; empty answers are not stored. With the same seed and settings the new answer is cut off again, so raise `max_tokens` first. Until then, `addPrompt()` refuses to add another turn to such a history. With DeepSeek-R1-style templates, which open the reasoning in the prompt, an output cut off before `</think>` contains no tag at all; it is recognised from the template and also stored as reasoning with an empty answer.
 
-Cut-off answers are marked with `"truncated": True` on the message (`messageTruncatedElement`), also in the checkpoint. `toJSON()` then only accepts a JSON value that starts at the answer's first bracket, so a cut-off array such as `[{...}, {"label": "li` yields `None`, not its first element.
+Cut-off answers are marked with `"truncated": True` on the message (`messageTruncatedElement`), also in the answer store. `toJSON()` then only accepts a JSON value that starts at the answer's first bracket, so a cut-off array such as `[{...}, {"label": "li` yields `None`, not its first element.
 
 Models that use OpenAI's "harmony" format (gpt-oss) put their reasoning into a separate channel instead of `<think>` tags and are not supported yet.
 
-### Resuming an interrupted run
+### The answer store: resuming and reusing answers
 
-`generate()` writes all histories to `prompt_tmp_folder/prompt_tmp_file` after every chunk. To resume, load that checkpoint and call `generate()` again; histories that already end with an answer are skipped. `importHistoriesFromFile()` raises `FileNotFoundError` if there is no checkpoint, i.e. no earlier run to resume:
+`generate()` stores the prompts and answers after every chunk in the answer store, a JSON file: `prompt_tmp_file` in `prompt_tmp_folder`, with the model name and the postfix added to its name, e.g. `answers_medgemma-4b-it_fewshot.json`. Before generating, it looks up every history in the store and uses the stored answer if there is one; only the others are generated. To resume an interrupted run, build the same histories again and call `generate()`:
 
 ```python
-try:
-    model.importHistoriesFromFile()
-except FileNotFoundError:
-    model.addPromptFromFile(index=0, amount=len(concepts))
-    # ... format the prompts as above
-model.generate()
+model.setPostfix("fewshot")
+model.addPromptsFromFile(0, concepts)
+model.generate()   # uses the answers of an earlier run, generates the rest
 ```
 
-**One checkpoint per run.** Runs that would write the same checkpoint at the same time, e.g. two models or the jobs of a Slurm job array started with one config, would overwrite each other's work. `generate()` and `exportHistoriesToFile()` therefore only write a checkpoint that does not exist yet, or that this `Model` wrote or imported itself and nobody changed since; otherwise they raise `RuntimeError` before generating anything. Give every concurrent run its own `prompt_tmp_file`, resume a checkpoint with `importHistoriesFromFile()`, or delete it to start over. The checkpoint also records the model, and `importHistoriesFromFile()` refuses one written with another model.
+`hasCheckpoint()` tells whether the store exists. Deleting it starts over; `setPostfix(postfix)` gives runs of the same model with other settings their own store and prompt log. The run metadata records the paths used (`files`), and every `generate()` call how many answers it generated, took from the store (`stored`) and copied to identical histories (`shared`).
 
-The checkpoint is a semicolon-delimited CSV with one row per history: a `_model` column with the model, a `system` column for the system prompt, and one prompt/answer column pair per turn, named after the prompt file (e.g. `mapping` and `mapping_answer`), or `promptN` / `promptN_answer` beyond the configured files. The reasoning of thinking models is stored in an extra `mapping_reasoning` column and cut-off answers are marked in `mapping_truncated` (each only present if some answer of that turn needs it); both are restored on import. Since the column names are derived from `prompt_files`, resume with the same `prompt_files` the checkpoint was written with.
+**Layout.** The store holds the settings the answers depend on and the histories as a tree by turn. Every prompt (system or user message) is a node keyed by the SHA-256 of its text, with its answer and the following prompts under `next`:
+
+```json
+{
+  "format": 1,
+  "settings": {"model": "google/medgemma-4b-it", "revision": "...", "seed": 42, "temperature": 0.01, "...": "..."},
+  "histories": {
+    "<SHA-256 of the first prompt>": {
+      "role": "user",
+      "prompt": "Label: Microcephaly",
+      "answer": {"text": "...", "reasoning": "...", "truncated": true},
+      "next": {"<SHA-256 of the second prompt>": {"role": "user", "prompt": "...", "answer": {"text": "..."}}}
+    }
+  }
+}
+```
+
+`reasoning` and `truncated` are only present for answers that have them. A stored answer is used only if the history's earlier answers are the stored ones as well, since an answer depends on them. Histories with the same prompts share their nodes: a turn several histories share (e.g. a first prompt about the same concept) is generated once, and identical histories in one `generate()` call get the same answer. Changing a prompt (also the system prompt) leads to new nodes, so its answers are generated anew while the other answers are kept.
+
+**Settings.** The answers depend on `model_id` and the model's revision, `seed`, `temperature`, `top_p`, `max_tokens`, `max_model_len`, `dtype`, `quantization`, `enable_thinking`, `reasoning_start_tag` and `reasoning_end_tag`. A store written with other values of these is refused with a `ValueError` naming them (an unknown revision, e.g. of a model missing from the local cache, counts as no difference); the other settings (folders, `chunk_size`, GPU memory, batching) may change.
+
+**Restoring histories.** A history is put back together exactly as it was generated: its prompts come from the caller, and every answer, with its reasoning and cut-off mark, from the node of its prompt, but only while the history's earlier answers are the stored ones. The turns stored after a prompt always followed the answer stored on it (or no answer, for two prompts in a row), so answers of different histories are never combined.
+
+**Concurrent runs.** Every write holds a lock on `<store>.lock`. If another run wrote the store in between, its answers are merged in first, so runs sharing a store (e.g. the jobs of a Slurm job array) keep each other's answers. If both runs answered the same prompt differently, the run writing last keeps its answer and the turns after it; the other run's turns after its answer are not stored.
 
 ### Errors
 
@@ -252,12 +290,13 @@ All methods raise an exception on failure; none returns an error code:
 | `addPrompt()` | `TypeError` if `message` is a string instead of a list; `ValueError` for an unknown role, if the number of messages is neither 1, nor the number of histories, nor used to create new histories, if a history ends with an empty answer, or if an answer (`"assistant"`) would not follow a user prompt |
 | `addPromptFromFile()` | `IndexError` for an invalid prompt index, `FileNotFoundError` for a missing prompt file, `ValueError` if `prompt_folder` is empty or `amount` is missing for empty histories |
 | `formatPromptFromFile()` | `IndexError` for an invalid history index, `KeyError` for a placeholder without a value, `ValueError` for a malformed template (e.g. an unescaped `{`) |
-| `exportHistoriesToFile()` | `ValueError` if there are no histories, `RuntimeError` if the checkpoint belongs to another run |
-| `importHistoriesFromFile()` | `FileNotFoundError` if there is no checkpoint, `ValueError` if it is empty or was written with another model |
-| `generate()` | `RuntimeError` if the model was closed with `close()`, or if the checkpoint belongs to another run |
+| `addPromptsFromFile()` | As `addPromptFromFile()` and `formatPromptFromFile()`; `ValueError` if `values` is empty or does not have one dict per history |
+| `generate()` | `ValueError` if the answer store is not one or was written with other settings, `RuntimeError` if there is something to generate but the model was closed with `close()` |
+| `getPrompt()`, `getAnswer()`, `getTurnCount()` | `IndexError` for an invalid history index or turn |
+| `setPostfix()` | `ValueError` if the postfix contains a path separator |
 | `toJSON()` | `IndexError` for an invalid history index; returns `None` if the history has no answer or the answer contains no JSON |
 
-`generate()` returns the number of answers it generated.
+`generate()` returns the number of answers it generated (not counting stored answers and copies for identical histories).
 
 Failures that do not stop a run are written to the log instead: a cleanup step of `close()` that fails, a model revision or GPU name that cannot be read for the run metadata (stored as `null`), and `device: "cpu"`.
 
@@ -274,7 +313,19 @@ Failures that do not stop a run are written to the log instead: a cleanup step o
 | `gpus` | Number and names of the GPUs and the CUDA version |
 | `prompt_files` | SHA-256 of every configured prompt file (`null` if missing) |
 | `config` | The complete `llm` configuration |
-| `generations` | One entry per `generate()` call: start and end time, duration, number of histories, answers, skipped and truncated history indices, prompt and generated tokens, and the approximate number of reasoning tokens |
+| `files` | Paths of the answer store and the prompt log |
+| `generations` | One entry per `generate()` call: start and end time, duration, number of histories, answers generated, taken from the store (`stored`) and copied to identical histories (`shared`), skipped and truncated history indices, prompt and generated tokens, and the approximate number of reasoning tokens |
+
+### Changes in 3.0
+
+Version 3.0 replaces the CSV checkpoint by the answer store (see [The answer store](#the-answer-store-resuming-and-reusing-answers)):
+
+- `generate()` uses stored answers and generates only the others, so resuming needs no extra call; identical histories are generated once. `exportHistoriesToFile()` and `importHistoriesFromFile()` were removed: build the histories again and call `generate()`.
+- The store records the settings the answers depend on and refuses a store written with other ones. Runs sharing a store merge their answers instead of being refused.
+- Checkpoints of 2.x (CSV) cannot be read; a store file that is not an answer store is refused with a `ValueError`. Use a new `prompt_tmp_file` name (e.g. `answers.json`) or delete the old checkpoints.
+- The store and the prompt log are named after the model, e.g. `answers_medgemma-4b-it.json` for `prompt_tmp_file: "answers.json"`, and `setPostfix()` adds a postfix to both.
+- New: `getModelName()`, `Model.getModelCount(config)`, `hasCheckpoint()`, `getTurnCount()`, `getPrompt()`, `getAnswer()` and `addPromptsFromFile()`.
+- The file lock and the atomic writes come from the logger package (v1.5.0: `lockedFile()`, `writeAtomically()`, `writeJSON()`); `model.ModelUtils.lockedFile` and `writeJSON` still work. `writeCheckpointCSV()` and the checkpoint column constants were removed, and pandas is no longer needed.
 
 ### Changes in 2.1
 
@@ -308,7 +359,7 @@ The test suite needs neither a GPU nor a downloaded model, nor `vllm` and `torch
 pytest -v
 ```
 
-`pytest` collects every `*Test.py` file in [`tests/`](./tests/README.md) (configured in `pyproject.toml`). Besides the methods of `Model`, the tests cover resuming an interrupted run from its checkpoint, the GPU and logger set-up of the constructor and the helpers in `ModelUtils.py`. The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
+`pytest` collects every `*Test.py` file in [`tests/`](./tests/README.md) (configured in `pyproject.toml`). Besides the methods of `Model`, the tests cover the answer store (resuming an interrupted run, reusing stored answers, refusing other settings, runs sharing a store), the GPU and logger set-up of the constructor and the helpers in `ModelUtils.py`. The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
 
 ## License
 

@@ -8,7 +8,7 @@ This directory contains the prompt template files (`.md` or `.txt`) loaded by th
 
 ## Configuration
 
-The prompt files and their order are set in the `llm` section of [`config/config.yaml`](../config/config.yaml). The position in `prompt_files` is the `index` used in code, and the file name (without extension) names the file's columns in the generation checkpoint:
+The prompt files and their order are set in the `llm` section of [`config/config.yaml`](../config/config.yaml). The position in `prompt_files` is the `index` used in code:
 
 ```yaml
 llm:
@@ -34,6 +34,8 @@ model.formatPromptFromFile(1, {"hpo_label": "Renal dysplasia", "sct_term": "Rena
 
 model.generate()
 ```
+
+`addPromptsFromFile(index, values)` does both steps at once, with one dict of values per history: `model.addPromptsFromFile(0, [{...}, {...}])`.
 
 `addPromptFromFile()` always adds the file as a **user** message. To give the model a system prompt, add it directly with `model.addPrompt(role="system", message=[...])` before loading the template.
 

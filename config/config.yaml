@@ -28,7 +28,7 @@ llm:
   max_tokens: 2048
   chunk_size: 500
   prompt_tmp_folder: "./data/tmp/"
-  prompt_tmp_file: "prompts_raw.tmp"
+  prompt_tmp_file: "answers.json"
   prompt_log_folder: "./data/logs/"
   prompt_log_file: "prompts.log"
   metadata_folder: "./data/logs/"
