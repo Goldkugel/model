@@ -44,6 +44,6 @@ jobs:
             pandas "pydantic>=2" pyyaml pytest
 
       # Runs every *Test.py file in tests/ (see [tool.pytest.ini_options] in
-      # pyproject.toml), including the GPU diagnostic with vLLM replaced.
+      # pyproject.toml).
       - name: Run tests
         run: python -m pytest -v

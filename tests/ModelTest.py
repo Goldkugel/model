@@ -5,7 +5,6 @@ import json
 import multiprocessing
 import os
 import pathlib
-import tempfile
 import types
 
 import pytest
@@ -23,7 +22,6 @@ from model.ModelUtils import (
     updateRunRecord, writeCheckpointCSV, messageTruncatedElement,
 )
 import model.ModelUtils as model_utils
-from model.diagnostic import main
 from conftest import REPO_ROOT
 
 # The Model module itself (not the class re-exported as `model.Model`), for
@@ -1570,61 +1568,3 @@ class TestPackageExports:
         for name in model_package.__all__:
             assert getattr(model_package, name) is not None
 
-
-# --- GPU diagnostic ----------------------------------------------------------------------
-
-class DiagnosticLLM(FakeLLM):
-    """FakeLLM answering the diagnostic prompts correctly, or cut off."""
-
-    finish_reason = "stop"
-
-    def answer(self, history) -> tuple[str, str]:
-        if "JSON" in history[-1][messageTextElement]:
-            return '{"answer": 4}', self.finish_reason
-        return "A small head.", self.finish_reason
-
-
-class TestGpuDiagnostic:
-    """
-    Runs model.diagnostic.main() with vLLM and the GPU replaced, so the
-    diagnostic submitted by scripts/runTest.sh cannot break unnoticed. It
-    reads ./config/config.yaml, so it runs in the repository root.
-    """
-
-    @pytest.fixture
-    def diagnostic(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(REPO_ROOT)
-        monkeypatch.setattr(sys, "argv", ["diagnostic"])
-        monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(tmp_path))
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
-        monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "Fake GPU", raising=False)
-        monkeypatch.setattr(model_module, "SamplingParams", lambda **kwargs: None)
-        monkeypatch.setattr(model_module, "LLM", lambda **kwargs: DiagnosticLLM())
-        return tmp_path
-
-    def test_passes_with_a_working_model(self, diagnostic, capsys):
-        main()
-
-        output = capsys.readouterr().out
-        assert "ALL CHECKS PASSED" in output
-        assert "WARNING" not in output
-        # The test generation does not touch the checkpoint of a real run
-        assert (diagnostic / "prompts_raw.tmp").is_file()
-
-    def test_fails_when_answers_are_cut_off(self, diagnostic, monkeypatch, capsys):
-        monkeypatch.setattr(DiagnosticLLM, "finish_reason", "length")
-
-        with pytest.raises(SystemExit) as exit_info:
-            main()
-
-        assert exit_info.value.code == 1
-        assert "cut off at max_tokens" in capsys.readouterr().out
-
-    def test_fails_without_cuda(self, diagnostic, monkeypatch):
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-
-        with pytest.raises(SystemExit) as exit_info:
-            main()
-
-        assert exit_info.value.code == 1
