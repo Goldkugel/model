@@ -72,6 +72,11 @@ def _rate(tokens: int, seconds: float) -> str:
     return f"{tokens / seconds:.0f}" if seconds > 0 else "-"
 
 
+def _firstIndexes(indexes: list, count: int = 10) -> str:
+    """Formats the first count indexes, e.g. "[1, 4, 7, ...]", for a short log row."""
+    return str(indexes[:count])[:-1] + (", ...]" if len(indexes) > count else "]")
+
+
 class Model:
     """
     Wrapper class around the vLLM engine to manage multi-turn chat sessions,
@@ -727,7 +732,9 @@ class Model:
                 l.log(
                     f"Chunk {chunk_number}/{chunk_count}: {len(batch_indices)} answers, "
                     f"{chunk_output_tokens} tokens in {chunk_seconds:.1f} s "
-                    f"({_rate(chunk_output_tokens, chunk_seconds)} tokens/s). "
+                    f"({_rate(chunk_output_tokens, chunk_seconds)} tokens/s)."
+                )
+                l.log(
                     f"Progress: {done}/{total} histories, elapsed {_duration(elapsed)}, "
                     f"remaining ~{_duration(remaining)}."
                 )
@@ -736,18 +743,23 @@ class Model:
         self.truncatedHistories.sort()
 
         elapsed = time.perf_counter() - run_start
+        # The indexes are listed up to 10, so that the row stays short; all
+        # are in skippedHistories and truncatedHistories.
         if self.skippedHistories:
-            l.log(f"Skipped {len(self.skippedHistories)} histories whose prompt exceeds max_model_len: {self.skippedHistories}")
+            l.log(f"Skipped {len(self.skippedHistories)} histories whose prompt exceeds "
+                  f"max_model_len: {_firstIndexes(self.skippedHistories)}")
         if self.truncatedHistories:
             l.log(f"{len(self.truncatedHistories)} answers were cut off at max_tokens "
-                  f"({self.config.max_tokens}): {self.truncatedHistories}")
+                  f"({self.config.max_tokens}): {_firstIndexes(self.truncatedHistories)}")
         if reasoning_tokens:
             l.log(f"Of the generated tokens, about {reasoning_tokens} were reasoning.")
         l.log(
             f"Generation completed: {generated} answers generated, {reused} stored and "
-            f"{shared} shared with identical histories; {prompt_tokens} prompt "
-            f"and {output_tokens} generated tokens in {_duration(elapsed)} "
-            f"({_rate(output_tokens, elapsed)} generated tokens/s)."
+            f"{shared} shared with identical histories."
+        )
+        l.log(
+            f"{prompt_tokens} prompt and {output_tokens} generated tokens in "
+            f"{_duration(elapsed)} ({_rate(output_tokens, elapsed)} generated tokens/s)."
         )
 
         # 8. Record the statistics of this call in the run metadata
