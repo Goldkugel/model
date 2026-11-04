@@ -1,8 +1,7 @@
 import sys
 
-# Prevent Python from generating .pyc files (compiled bytecode files), to
-# keep container environments clean. Set here only: this file runs before any
-# module of the package.
+# No .pyc files, to keep container environments clean. Set here, as this file
+# runs before any module of the package.
 sys.dont_write_bytecode = True
 
 from .Model         import Model

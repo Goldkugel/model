@@ -5,53 +5,33 @@ import hashlib
 import json
 import os
 
-# ==============================================================================
-# Role Definitions
-# Standard chat message roles matching conventions used by chat-tuned LLM 
-# interfaces.
-# ==============================================================================
+# Chat message roles, as the chat templates expect them
 systemRole      = "system"
 userRole        = "user"
 modelRole       = "assistant"
-# Every role a message may have
 chatRoles       = (systemRole, userRole, modelRole)
 
-# ==============================================================================
-# Execution Device Identifiers
-# ==============================================================================
 # Values of ModelConfig.device; only gpu is supported yet
 gpu             = "cuda"
 cpu             = "cpu"
 # Name of the environment variable selecting vLLM's backend
 target_device   = "VLLM_TARGET_DEVICE"
 
-# ==============================================================================
-# History Key Constants
-# Keys of the message dictionaries that make up a conversation history, in
-# the format expected by the tokenizer's chat template.
-# ==============================================================================
+# Keys of the messages of a history, as the chat template expects them
 messageRoleElement = "role"
 messageTextElement = "content"
-# Reasoning of a thinking model, stored on its answer message next to the
-# answer text. It is not sent back to the model: Model passes only the role
-# and content keys to vLLM and the chat template.
+# Reasoning of a thinking model, stored on its answer message; never sent
+# back to the model, which only gets role and content.
 messageReasoningElement = "reasoning"
-# Set to True on an answer that was cut off at max_tokens. toJSON() then only
-# accepts JSON that starts at the answer's first bracket, so it does not
-# return a fragment of a cut-off object or array.
+# True on an answer cut off at max_tokens (see Model.toJSON())
 messageTruncatedElement = "truncated"
-
-# ==============================================================================
-# Logging Utilities
-# ==============================================================================
 
 def writePrompt(path: str, histories: list[list[dict]]) -> int:
     """
-    Writes prompt and response histories to a semicolon-delimited log file,
-    one message per row, for human inspection. The text is sanitized, so
-    the log cannot be read back into histories (the answer store is used
-    to restore them). Only
-    the message text is written, not the reasoning of thinking models.
+    Writes the histories to a semicolon-delimited log file, one message per
+    row, for human inspection. The text is sanitized, so the log cannot be
+    read back (the answer store restores histories). The reasoning of
+    thinking models is not written.
 
     :param path: Destination file path for the prompt log.
     :param histories: List of conversation threads, where each thread is a list
@@ -67,24 +47,18 @@ def writePrompt(path: str, histories: list[list[dict]]) -> int:
     makeParentFolder(path)
 
     with open(path, mode="w", encoding="utf-8") as prompt_log_file:
-        # Write CSV header row
         header = "history;prompt;role;length;text\n"
         prompt_log_file.write(header)
 
-        # Iterate over each conversation history thread
         for history_idx, history in enumerate(histories):
-            # Iterate over each message turn within the history thread
             for message_idx, prompt in enumerate(history):
                 role = prompt[messageRoleElement]
                 text = str(prompt[messageTextElement])
                 
-                # Replace newlines with spaces to maintain one log entry per 
-                # line, and sanitize embedded semicolons to prevent column 
-                # misalignment.
+                # One row per message, and no extra columns
                 sanitized_text = text.replace('\r\n', ' ').replace('\n', ' ').replace(';', ',')
 
-                # Format row: history_index; message_index; role; 
-                # raw_character_length; sanitized_text
+                # The length is that of the original text
                 log_line = f"{history_idx};{message_idx};{role};{len(text)};{sanitized_text}\n"
                 
                 prompt_log_file.write(log_line)
@@ -94,13 +68,8 @@ def writePrompt(path: str, histories: list[list[dict]]) -> int:
     
     return total_written
 
-# ==============================================================================
-# File Utilities
-# ==============================================================================
-
-# The answer store (see AnswerStore), the run metadata and the file lock use
-# the file helpers of the logger package: writeAtomically(), writeJSON() and
-# lockedFile().
+# Atomic writes and file locks come from the logger package (writeJSON(),
+# lockedFile()).
 
 def fileStamp(path: str) -> Optional[tuple[int, int, int]]:
     """
@@ -118,9 +87,8 @@ def fileStamp(path: str) -> Optional[tuple[int, int, int]]:
 def updateRunRecord(path: str, record: dict, key: str = "run_id") -> None:
     """
     Replaces the record with the same `key` in the JSON list at `path`, or
-    appends it, keeping all other records. The read and the write happen
-    under one lock (see the logger's lockedFile()), so records of runs updating the file
-    at the same time are not lost.
+    appends it, keeping all other records. Read and write happen under one
+    lock (the logger's lockedFile()), so concurrent runs lose no records.
 
     :param path: Path of the JSON file; created if it does not exist.
     :param record: Record to store; must contain `key`.
@@ -139,10 +107,6 @@ def updateRunRecord(path: str, record: dict, key: str = "run_id") -> None:
         records.append(record)
         writeJSON(records, path)
 
-
-# ==============================================================================
-# Run Metadata Utilities
-# ==============================================================================
 
 # Packages whose installed versions are recorded in the run metadata
 metadataPackages = ["model", "logger", "vllm", "torch", "transformers"]

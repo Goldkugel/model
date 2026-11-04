@@ -38,27 +38,20 @@ import yaml
 import json
 import re
 
-# Suppress verbose vLLM initialization and internal status logs
 logging.getLogger("vllm").setLevel(logging.ERROR)
 
-# Ensure CUDA devices are enumerated by PCI bus ID
-# This guarantees consistent GPU ordering across runs
+# Consistent GPU ordering across runs
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# Tell vLLM to use its CUDA backend (CPU execution is not supported yet).
-# This is also vLLM's default; setting it overrides a "cpu" inherited from
-# the environment, which would select vLLM's CPU backend.
+# vLLM's default, but overrides a "cpu" inherited from the environment (CPU
+# execution is not supported yet).
 os.environ[target_device] = "cuda"
 
 # CUDA_VISIBLE_DEVICES is deliberately left alone: it selects the GPUs (e.g.
-# set by Slurm), and vLLM uses all of them via tensor_parallel_size, which
-# __init__ takes from torch.cuda.device_count() within that selection.
+# set by Slurm), and vLLM uses all of them via tensor_parallel_size.
 
-# Global configuration constants
-# YAML key where LLM config options are stored
+# Sections of the YAML config file, and its default path
 configuration_section: str = "llm"       
-# YAML key of the logger settings in the same file (see the logger package)
 logger_section: str = "logger"
-# Default path for the configuration file
 standard_directory: str = "./config/config.yaml"  
 
 def _duration(seconds: float) -> str:
@@ -118,36 +111,29 @@ class Model:
         self.sampling_params: Optional[SamplingParams] = None
         self.model: Optional[str] = None
         self.config: Optional[ModelConfig] = None
-        # Indices of the histories the last generate() call skipped because
-        # their prompt does not fit into config.max_model_len
+        # Histories the last generate() skipped (prompt exceeds max_model_len)
         self.skippedHistories: list[int] = []
-        # Indices of the histories whose answer the last generate() call cut
-        # off at config.max_tokens (finish_reason "length")
+        # Histories whose last answer was cut off at max_tokens
         self.truncatedHistories: list[int] = []
-        # Run metadata (see _writeRunMetadata()): one statistics record per
-        # generate() call, under an id unique to this instance
+        # Run metadata (see _writeRunMetadata())
         self.runId: str = uuid.uuid4().hex
         self.runStarted: str = datetime.now().astimezone().isoformat(timespec="seconds")
         self.modelIndex: int = index
         self.gpuCount: int = 0
         self.generationStats: list[dict] = []
-        # The stored prompts and answers (the checkpoint), loaded by the first
-        # generate() call; see _answerStore()
+        # The checkpoint, loaded by the first generate(); see _answerStore()
         self.store: Optional[AnswerStore] = None
-        # Hugging Face revision of the model, looked up once by _modelRevision()
+        # Looked up once by _modelRevision()
         self.revision: Optional[str] = None
         self.revisionLooked: bool = False
-        # Added to the names of the checkpoint and the prompt log, after the
-        # model name; see setPostfix() and _fileName()
+        # See setPostfix()
         self.postfix: str = ""
 
-        # --- Step 1: Load and Validate Configuration ---
         self.config, logger_path, logger_settings = Model._resolveConfig(config)
 
-        # The Logger is a process-wide singleton. If the entry point has not
-        # configured it yet, configure it from the same source as the model:
-        # the same YAML file, or the "logger" key of the same dict. Without
-        # either, Logger() falls back to ./config/config.yaml.
+        # The Logger is a process-wide singleton. If it is not configured yet,
+        # configure it from the same file or dict; otherwise Logger() falls
+        # back to ./config/config.yaml.
         if Logger.config is None and logger_path is not None:
             l = Logger(logger_path)
         else:
@@ -155,7 +141,6 @@ class Model:
                 Logger.config = LoggerConfig.model_validate(logger_settings)
             l = Logger()
 
-        # --- Step 2: Validate Model Selection Index ---
         if not (0 <= index < len(self.config.model_id)):
             l.log(f"No model specified or index {index} out of range.")
             raise ValueError(
@@ -172,9 +157,7 @@ class Model:
             l.log("WARNING: device 'cpu' is not supported yet; the model is loaded on the GPU.")
         l.log(f"Scanning device '{device}'...")
 
-        # --- Step 3: Check CUDA Availability ---
-        # Fail before vLLM is started, which would otherwise abort with a
-        # far less readable error.
+        # Fail before vLLM starts, whose error would be far less readable.
         cuda_ok = torch.cuda.is_available()
         l.log(f"Cuda available: {cuda_ok}.")
 
@@ -192,9 +175,7 @@ class Model:
 
         l.log(f"Scanning device '{device}' completed.")
         
-        # --- Step 4: Configure vLLM Sampling Parameters ---
-        # The per-request seed makes each answer reproducible regardless of
-        # how requests are batched.
+        # The per-request seed makes each answer independent of the batching.
         self.sampling_params = SamplingParams(
             temperature=self.config.temperature,
             top_p=self.config.top_p,
@@ -202,15 +183,11 @@ class Model:
             seed=self.config.seed
         )
 
-        # --- Step 5: Initialize the vLLM Engine ---
         l.log(f"Loading model into {device}...")
         
         self.llm = LLM(
             model=model,
-            # Shard the model across all visible GPUs
             tensor_parallel_size=gpus,
-            # True skips CUDA graph capture: slower generation, but faster
-            # start-up and less GPU memory
             enforce_eager=self.config.enforce_eager,
             max_model_len=self.config.max_model_len,
             max_num_batched_tokens=self.config.max_num_batched_tokens,
@@ -219,10 +196,7 @@ class Model:
             dtype=self.config.dtype,
             quantization=self.config.quantization,
             enable_prefix_caching=self.config.enable_prefix_caching,
-            # Mixture-of-Experts models (configured via
-            # config.expert_parallel_models) need expert parallelism to
-            # shard their experts across the available GPUs; dense models
-            # ignore this flag.
+            # Mixture-of-Experts models shard their experts across the GPUs
             enable_expert_parallel=any(
                 pattern in model for pattern in self.config.expert_parallel_models
             ),
@@ -230,9 +204,8 @@ class Model:
 
         l.log(f"Loading model into {device} completed.")
 
-        # --- Step 6: Record versions, model revision and GPUs ---
         # If this fails (e.g. a corrupt metadata file), the caller gets no
-        # Model to close(), so release the engine here before re-raising.
+        # Model to close(), so release the engine here.
         try:
             self._writeRunMetadata()
         except Exception:
@@ -257,15 +230,13 @@ class Model:
         :raises FileNotFoundError: If the config file does not exist.
         :raises KeyError: If the config file has no "llm" section.
         """
-        # Copy a given ModelConfig so later changes by the caller do not
-        # silently change the model's configuration.
+        # A copy, so later changes by the caller do not affect the model.
         if isinstance(config, ModelConfig):
             return config.model_copy(deep=True), None, None
 
         if isinstance(config, dict):
-            # A full configuration (the parsed YAML file) has an "llm" key,
-            # which is not a valid llm setting itself, so the two kinds of
-            # dict cannot be confused.
+            # A full configuration has an "llm" key, which is not a valid
+            # setting itself, so the two kinds cannot be confused.
             if configuration_section in config:
                 section = config[configuration_section] or {}
                 return ModelConfig.model_validate(section), None, config.get(logger_section)
@@ -276,15 +247,13 @@ class Model:
             Logger().log(f"Config file not found at '{path}'.")
             raise FileNotFoundError(f"Config file not found at '{path}'")
 
-        # An empty file parses to None, so fall back to an empty dict to get
-        # the clearer "missing section" error below instead of a TypeError.
+        # An empty file parses to None; {} gives the clearer error below.
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
 
         if configuration_section not in data:
             raise KeyError(f"Config file '{path}' has no '{configuration_section}' section.")
 
-        # Only hand the path on to the Logger if the file has logger settings.
         logger_path = path if logger_section in data else None
         return ModelConfig.model_validate(data[configuration_section] or {}), logger_path, None
 
@@ -314,24 +283,21 @@ class Model:
         if message is None:
             message = []
 
-        # A string is a sequence too: without this check, "hello" would be
-        # added as the five messages "h", "e", "l", "l", "o".
+        # Otherwise "hello" would be added as five messages "h", "e", ...
         if isinstance(message, str):
             l.log("addPrompt: message is a string, not a list of strings.")
             raise TypeError("addPrompt: 'message' must be a list of strings, not a string.")
 
         # Other roles (e.g. Gemini's "model") are not understood by the chat
-        # templates, by generate() or by the answer store, which would store
-        # them as prompts.
+        # templates or generate(), and the answer store would store them as
+        # prompts.
         if message and role not in chatRoles:
             error = f"addPrompt: unknown role '{role}'; expected one of {list(chatRoles)}."
             l.log(error)
             raise ValueError(error)
 
-        # An empty answer (a thinking model cut off during its reasoning)
-        # must be generated again before the next turn: the answer store does
-        # not store empty answers, so the next turn would be answered without
-        # an answer to this one.
+        # An empty answer (a thinking model cut off during its reasoning) is
+        # not stored, so it must be generated again before the next turn.
         if message and self.messageHistories:
             empty = [
                 idx for idx, history in enumerate(self.messageHistories)
@@ -345,10 +311,9 @@ class Model:
                 l.log(error)
                 raise ValueError(error)
 
-        # An answer must follow a user prompt. The answer store pairs every
-        # answer with the prompt before it, so an answer at the start of a
-        # history or after another answer would be stored as a prompt, and
-        # one after a system prompt as the answer to the system prompt.
+        # The answer store pairs every answer with the prompt before it, so an
+        # answer anywhere else would be stored as a prompt or as the answer to
+        # a system prompt.
         if message and role == modelRole:
             without_prompt = [
                 idx for idx, history in enumerate(self.messageHistories)
@@ -360,8 +325,7 @@ class Model:
                 l.log(error)
                 raise ValueError(error)
 
-        # Case 1: Broadcast a single prompt to every existing conversation
-        # thread
+        # Case 1: broadcast
         if len(message) == 1 and len(self.messageHistories) > 0:
             for history in self.messageHistories:
                 history.append({
@@ -369,7 +333,7 @@ class Model:
                     messageTextElement: message[0]
                 })
 
-        # Case 2: Append one distinct message per existing conversation thread
+        # Case 2: one message per history
         elif (len(message) == len(self.messageHistories) and
             len(self.messageHistories) > 0):
             for idx, history in enumerate(self.messageHistories):
@@ -378,8 +342,7 @@ class Model:
                     messageTextElement: message[idx]
                 })
 
-        # Case 3: Initialize new conversation threads when history is
-        # currently empty
+        # Case 3: new histories
         elif len(self.messageHistories) == 0 and len(message) > 0:
             for msg in message:
                 self.messageHistories.append([{
@@ -387,8 +350,6 @@ class Model:
                     messageTextElement: msg
                 }])
 
-        # Invalid combination: adding the messages anyway would misalign the
-        # conversation threads.
         elif len(message) > 0:
             error = (
                 f"addPrompt: message count ({len(message)}) does not match "
@@ -445,7 +406,6 @@ class Model:
         """
         l = Logger()
 
-        # Guard Clause: Validate prompt file index bounds
         if not (0 <= index < len(self.config.prompt_files)):
             l.log(f"Invalid prompt index: {index}.")
             raise IndexError(
@@ -453,7 +413,6 @@ class Model:
                 f"({len(self.config.prompt_files)} entries)."
             )
 
-        # Guard Clause: Check if prompt folder path is specified
         if not self.config.prompt_folder:
             l.log("No prompt folder specified in config.")
             raise ValueError("No prompt folder specified in config.")
@@ -461,12 +420,10 @@ class Model:
         file_name = self.config.prompt_files[index]
         file_path = Path(self.config.prompt_folder) / file_name
 
-        # Guard Clause: Ensure prompt file exists on disk
         if not file_path.is_file():
             l.log(f"File '{file_name}' not found at {file_path}.")
             raise FileNotFoundError(f"Prompt file '{file_name}' not found at {file_path}.")
 
-        # Guard Clause: Without histories, `amount` says how many to create
         if len(self.messageHistories) == 0 and amount <= 0:
             l.log("Histories empty and valid 'amount' not specified.")
             raise ValueError("Histories are empty: 'amount' must be positive.")
@@ -475,17 +432,12 @@ class Model:
         prompt = file_path.read_text(encoding="utf-8")
         l.log(f"Loaded prompt with base length {len(prompt)}.")
 
-        # Determine how to append/multiply the loaded prompt
+        # Broadcast to existing histories, or create `amount` new ones
         if len(self.messageHistories) > 0:
-            # If histories already exist, broadcast this prompt as a 
-            # single item
             prompts = [prompt]
         else:
-            # If starting fresh, replicate the prompt 'amount' times to 
-            # create N parallel threads
             prompts = [prompt] * amount
 
-        # Add prompt to history and capture return count
         ret = self.addPrompt(userRole, prompts)
         l.log(f"Added the prompt to {ret} histories.")
         l.log(f"Loading prompt from file '{file_name}' completed.")
@@ -515,7 +467,6 @@ class Model:
 
         raw_template = message[messageTextElement]
 
-        # Step 1: Format template placeholders with dictionary values
         try:
             formatted_prompt = raw_template.format(**values)
         except KeyError as e:
@@ -525,9 +476,7 @@ class Model:
             l.log(f"Failed to format prompt template at history {index}: {str(e).rstrip('.')}.")
             raise ValueError(f"Malformed prompt template at history {index}: {e}") from e
 
-        # Step 2: Update the message content in-place. `message` is the very
-        # dict stored in self.messageHistories[index], so no write-back is
-        # needed.
+        # `message` is the dict stored in the history, so no write-back needed
         message[messageTextElement] = formatted_prompt
 
         return len(formatted_prompt) - len(raw_template)
@@ -537,34 +486,22 @@ class Model:
         Generates an answer for every history that does not end with a model
         answer yet.
 
-        Answers stored in the answer store (the checkpoint, see
-        _answerStore()) are used instead of being generated again: for a
-        history whose prompts, and earlier answers, are stored with an
-        answer. Histories that are identical (the same prompts and answers so
-        far) are generated once and get the same answer. The others are sent
-        to vLLM's chat interface, which formats them with the tokenizer's
-        chat template, in chunks of config.chunk_size; after every chunk the
-        answers are appended to their histories and stored, so an
-        interrupted run is resumed by calling generate() again with the same
-        prompts.
+        Answers in the answer store (the checkpoint, see _answerStore()) are
+        reused, and identical histories are generated once. The rest is sent
+        to vLLM's chat interface in chunks of config.chunk_size; the answers
+        are stored after every chunk, so calling generate() again with the
+        same prompts resumes an interrupted run.
 
-        For thinking models, the reasoning is split off the answer (see
-        _splitReasoning()): the answer becomes the message text, the
-        reasoning is stored under messageReasoningElement on the same
-        message and is never sent back to the model. Answers cut off at
-        config.max_tokens are listed in self.truncatedHistories; a thinking
-        model cut off during its reasoning gets an empty answer, which is not
-        stored and which the next generate() call replaces by a new one (with
-        the same seed and settings, it is cut off again, so raise max_tokens
-        first).
+        The reasoning of thinking models is split off the answer (see
+        _splitReasoning()) and stored under messageReasoningElement; it is
+        never sent back to the model. Answers cut off at max_tokens are listed
+        in self.truncatedHistories; one cut off during the reasoning is empty,
+        not stored, and replaced by the next generate() call (raise
+        max_tokens first, or it is cut off again).
 
         A history whose prompt does not fit into config.max_model_len is
-        skipped instead of failing its whole chunk: it keeps no answer, its
-        index is stored in self.skippedHistories, and toJSON() returns None
-        for it.
-
-        Progress and throughput are logged after every chunk, and the
-        statistics of the call are added to the run metadata file.
+        skipped and listed in self.skippedHistories, instead of failing its
+        whole chunk.
 
         :return: Number of answers generated (not counting stored answers and
             the copies for identical histories).
@@ -577,9 +514,7 @@ class Model:
         self.skippedHistories = []
         self.truncatedHistories = []
 
-        # 1. Identify indices where the model has not yet generated a response
-        # (Histories whose last message role is NOT modelRole), or only an
-        # empty one
+        # Histories without an answer to their last prompt, or an empty one
         unprocessed_indices = [
             idx for idx, history in enumerate(self.messageHistories)
             if history and (
@@ -592,12 +527,10 @@ class Model:
             l.log("No histories without an answer; nothing to generate.")
             return 0
 
-        # Fails now, before anything is generated, if the stored answers were
-        # generated with other settings
+        # Fails before anything is generated if the settings differ
         store = self._answerStore()
 
-        # Empty answers are replaced: remove them, so the prompt before them
-        # is answered again
+        # Remove empty answers, so their prompt is answered again
         for idx in unprocessed_indices:
             if Model._endsWithEmptyAnswer(self.messageHistories[idx]):
                 self.messageHistories[idx].pop()
@@ -606,7 +539,6 @@ class Model:
         run_start = time.perf_counter()
         l.log(f"Generating answers for {len(unprocessed_indices)} histories...")
 
-        # 2. Use the stored answers
         missing_indices = []
         reused = 0
         for idx in unprocessed_indices:
@@ -621,8 +553,7 @@ class Model:
         if reused:
             l.log(f"Using {reused} stored answers of {len(unprocessed_indices)} histories without an answer.")
 
-        # 3. Identical histories are generated once: the first of them is
-        # generated, the others get a copy of its answer
+        # Identical histories: the first is generated, the others get copies
         copies: dict[int, list[int]] = {}
         first_of: dict[str, int] = {}
         generate_indices = []
@@ -647,15 +578,13 @@ class Model:
 
         if generate_indices:
             tokenizer = self.llm.get_tokenizer()
-            # Whether the chat template opens the reasoning in the prompt (e.g.
-            # DeepSeek-R1); the same for every history, as they share template
-            # and settings
+            # The same for every history, as they share template and settings
             prompt_opens_reasoning = self._promptOpensReasoning(
                 tokenizer, self.messageHistories[generate_indices[0]]
             )
             chunk_size = self.config.chunk_size
             total = len(generate_indices)
-            # Number of chunks, i.e. total / chunk_size rounded up
+            # Rounded up
             chunk_count = -(-total // chunk_size)
 
             l.log(f"{total} histories to generate in {chunk_count} chunk(s) of up to {chunk_size}.")
@@ -664,13 +593,12 @@ class Model:
 
             done = 0
 
-            # 4. Process inference in chunked batches
             for chunk_number, i in enumerate(range(0, total, chunk_size), start=1):
                 chunk_indices = generate_indices[i : i + chunk_size]
                 chunk_start = time.perf_counter()
 
-                # Leave out prompts that do not fit into the context window: vLLM
-                # would reject the whole chunk because of a single one of them
+                # vLLM would reject the whole chunk for a single prompt that
+                # does not fit into the context window
                 batch_indices = [idx for idx in chunk_indices if self._fitsContext(tokenizer, idx)]
                 for idx in chunk_indices:
                     if idx not in batch_indices:
@@ -684,7 +612,6 @@ class Model:
                     )
                     l.log(f"{chunk_task}...")
 
-                    # Run batched generation over the chat histories
                     results = self.llm.chat(
                         [self._chatMessages(self.messageHistories[idx]) for idx in batch_indices],
                         self.sampling_params,
@@ -692,9 +619,6 @@ class Model:
                         **self._chatTemplateArguments()
                     )
 
-                    # 5. Append outputs back to their respective histories, and
-                    # their identical histories, with the reasoning of thinking
-                    # models split off the answer
                     for idx, result in zip(batch_indices, results):
                         completion = result.outputs[0]
                         truncated = getattr(completion, "finish_reason", None) == "length"
@@ -709,10 +633,9 @@ class Model:
                             message[messageTruncatedElement] = True
                         if reasoning:
                             message[messageReasoningElement] = reasoning
-                            # vLLM only reports the token count of the whole
-                            # output, so the reasoning is tokenized again to
-                            # estimate its share (approximate: the tags and the
-                            # whitespace stripped by _splitReasoning() are lost)
+                            # vLLM only counts the whole output, so the reasoning
+                            # is re-tokenized (approximate: tags and stripped
+                            # whitespace are lost)
                             reasoning_tokens += len(tokenizer.encode(reasoning, add_special_tokens=False))
                         for target in [idx] + copies[idx]:
                             self.messageHistories[target].append(dict(message))
@@ -726,19 +649,16 @@ class Model:
 
                     l.log(f"{chunk_task} completed.")
 
-                    # 6. Store the answers after every chunk, so a killed job
-                    # (e.g. by a Slurm time limit) loses at most one chunk of work
+                    # A killed job (e.g. by a Slurm time limit) loses at most one chunk
                     store.save()
 
                 output_tokens += chunk_output_tokens
                 done += len(chunk_indices)
                 generated += len(batch_indices)
 
-                # 7. Log progress, throughput and the estimated remaining time
                 chunk_seconds = time.perf_counter() - chunk_start
                 elapsed = time.perf_counter() - run_start
-                # Extrapolated from the average time per history so far, skipped
-                # histories included
+                # From the average time per history so far, skipped ones included
                 remaining = elapsed / done * (total - done)
                 l.log(
                     f"Chunk {chunk_number}/{chunk_count}: {len(batch_indices)} answers, "
@@ -754,8 +674,8 @@ class Model:
         self.truncatedHistories.sort()
 
         elapsed = time.perf_counter() - run_start
-        # The indexes are listed up to 10, so that the row stays short; all
-        # are in skippedHistories and truncatedHistories.
+        # At most 10 indexes per row; all are in skippedHistories and
+        # truncatedHistories.
         if self.skippedHistories:
             l.log(f"Skipped {len(self.skippedHistories)} histories whose prompt exceeds "
                   f"max_model_len: {_firstIndexes(self.skippedHistories)}.")
@@ -774,7 +694,6 @@ class Model:
         )
         l.log(f"Generating answers for {len(unprocessed_indices)} histories completed.")
 
-        # 8. Record the statistics of this call in the run metadata
         self.generationStats.append({
             "started": started,
             "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -787,7 +706,7 @@ class Model:
             "truncated": list(self.truncatedHistories),
             "prompt_tokens": prompt_tokens,
             "generated_tokens": output_tokens,
-            # Re-tokenized from the split-off reasoning, so approximate
+            # Approximate, see above
             "reasoning_tokens": reasoning_tokens,
         })
         self._writeRunMetadata()
@@ -801,8 +720,7 @@ class Model:
         within config.max_model_len. Otherwise the index is added to
         self.skippedHistories.
         """
-        # Format the prompt exactly as generate() sends it: without stored
-        # reasoning and with the same chat template arguments
+        # Exactly as generate() sends it
         token_ids = tokenizer.apply_chat_template(
             self._chatMessages(self.messageHistories[index]),
             tokenize=True,
@@ -871,20 +789,15 @@ class Model:
         """
         Splits a model output into (reasoning, answer), both stripped.
 
-        - With config.reasoning_end_tag in the text, the reasoning is the
-          text before its first occurrence (without a leading
-          config.reasoning_start_tag) and the answer the text after it.
-          This also covers chat templates that put the start tag into the
-          prompt (e.g. DeepSeek-R1), whose output has no start tag.
-        - With a start tag but no end tag, the output was cut off during
-          the reasoning: everything is reasoning and the answer is empty.
-          The same holds for a `truncated` output without an end tag if the
-          template opened the reasoning in the prompt
-          (`prompt_opens_reasoning`); otherwise a JSON draft from the middle
-          of the reasoning could be taken for the answer.
-        - Otherwise (non-thinking models, thinking switched off, or
-          splitting disabled with reasoning_end_tag = null) everything is
-          the answer.
+        - With the end tag in the text: the reasoning is the text before its
+          first occurrence (without a leading start tag, which DeepSeek-R1's
+          output lacks), the answer the text after it.
+        - With a start tag but no end tag, or a `truncated` output when the
+          prompt opened the reasoning (`prompt_opens_reasoning`): cut off
+          during the reasoning, so the answer is empty (a JSON draft from the
+          reasoning must not be taken for the answer).
+        - Otherwise (non-thinking model, thinking off, or reasoning_end_tag
+          null): everything is the answer.
         """
         end_tag   = self.config.reasoning_end_tag
         start_tag = self.config.reasoning_start_tag
@@ -916,10 +829,8 @@ class Model:
         prompt file and the statistics of every generate() call.
 
         The file holds a JSON list with one entry per Model instance (keyed
-        by self.runId); this instance's entry is replaced, all others are
-        kept, so resumed runs append to the same file. The update is locked
-        (see updateRunRecord()), so runs sharing the file at the same time
-        do not lose each other's entries.
+        by self.runId); only this instance's entry is replaced, under a lock
+        (see updateRunRecord()).
 
         :raises ValueError: If the existing file is not a JSON list.
         """
@@ -927,8 +838,6 @@ class Model:
 
         gpu_names = []
         for gpu_index in range(self.gpuCount):
-            # The metadata is still written without a name, but the reason
-            # is logged
             try:
                 gpu_names.append(torch.cuda.get_device_name(gpu_index))
             except Exception as e:
@@ -995,12 +904,10 @@ class Model:
 
     def setPostfix(self, postfix: str = "") -> None:
         """
-        Sets the postfix added to the names of the checkpoint (the answer
-        store) and the prompt log, after the model name, e.g.
-        "answers_medgemma-4b-it_fewshot.json" for config.prompt_tmp_file
-        "answers.json" and the postfix "fewshot". Runs of the same model with
-        other settings thereby get their own files; "" removes the postfix.
-        The next generate() call uses the answer store of the new name.
+        Sets the postfix added to the names of the checkpoint and the prompt
+        log after the model name, e.g. "answers_medgemma-4b-it_fewshot.json",
+        so runs with other settings get their own files; "" removes it. The
+        next generate() call uses the answer store of the new name.
 
         :param postfix: Text added to the file names.
         :raises ValueError: If `postfix` contains a path separator.
@@ -1071,14 +978,11 @@ class Model:
 
     def toJSON(self, index: int) -> Optional[dict | list]:
         """
-        Parses the last model answer of the history at the given index into
-        a native Python value. Tried in this order: the content of the first
-        Markdown code block, the first complete JSON object or array
-        anywhere in the answer, and the whole answer as a bare JSON scalar.
-        Only the answer is searched, never the reasoning of a thinking model.
-        For an answer cut off at max_tokens, the JSON value must start at its
-        first bracket: a cut-off array such as '[{"a": 1}, {"b":' must not
-        yield its first element as if it were the result.
+        Parses the last model answer of a history (never the reasoning) into
+        a Python value. Tried in order: the first Markdown code block, the
+        first complete JSON object or array, the whole answer as a JSON
+        scalar. For an answer cut off at max_tokens, the value must start at
+        its first bracket, so '[{"a": 1}, {"b":' does not yield {"a": 1}.
 
         :param index: Index of the target message history.
         :return: Parsed JSON value, or None if the history has no answer
@@ -1090,7 +994,6 @@ class Model:
 
         history = self._history(index)
         
-        # Ensure history has messages and the last message came from the model
         if not history or history[-1].get(messageRoleElement) != modelRole:
             l.log(f"No model response found at history index {index}.")
             return None
@@ -1100,19 +1003,16 @@ class Model:
             l.log(f"Empty text at history index {index}.")
             return None
 
-        # Strategy 1: Extract JSON inside markdown code blocks ```json ... ``` or ``` ... ```
         json_code_block = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
         if json_code_block:
             substring = json_code_block.group(1).strip()
             try:
                 return json.loads(substring)
             except json.JSONDecodeError:
-                pass  # Fall back to regex scan if code block string isn't valid JSON
+                pass
 
-        # Strategy 2: Decode the first complete JSON object {...} or array
-        # [...] starting at any opening bracket. raw_decode stops at the end
-        # of the JSON value, so trailing prose (even prose containing
-        # brackets) does not break parsing.
+        # raw_decode stops at the end of the value, so trailing prose (even
+        # with brackets) does not break parsing.
         decoder = json.JSONDecoder()
         truncated = bool(history[-1].get(messageTruncatedElement))
         for bracket in re.finditer(r"[\{\[]", text):
@@ -1125,8 +1025,6 @@ class Model:
                     return None
                 continue
 
-        # Strategy 3: Parse the whole text, which only succeeds for a bare
-        # JSON scalar such as a number or a string
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -1265,17 +1163,15 @@ class Model:
     def logPrompts(self) -> None:
         """
         Writes every message of every history to the prompt log (see
-        _promptLogPath()), overwriting it;
-        see writePrompt(). The reasoning of thinking models is not logged.
+        _promptLogPath() and writePrompt()), overwriting it. The reasoning of
+        thinking models is not logged.
         """
         writePrompt(self._promptLogPath(), self.messageHistories)
 
     def close(self) -> None:
         """
-        Explicitly cleans up vLLM engine instances, PyTorch CUDA memory, and 
-        distributed process groups.
-        Helps prevent VRAM leaks when dynamically instantiating or destroying 
-        models.
+        Releases the vLLM engine, CUDA memory and the distributed process
+        groups, so loading another model does not leak GPU memory.
         """
         if hasattr(self, 'llm') and self.llm is not None:
             del self.llm
@@ -1291,8 +1187,8 @@ class Model:
         if distributed.is_available() and distributed.is_initialized():
             steps.append(("destroy_process_group", distributed.destroy_process_group))
 
-        # A failing step must not block the following ones, but is logged:
-        # it may leave GPU memory or processes behind.
+        # A failing step must not block the others, but is logged, as it may
+        # leave GPU memory or processes behind.
         for name, step in steps:
             try:
                 step()
