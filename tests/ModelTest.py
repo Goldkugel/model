@@ -1799,6 +1799,82 @@ class TestModelUtils:
         assert any("revision of model 'org/name'" in message for message in logged)
 
 
+# --- Log messages ----------------------------------------------------------------------
+
+def _assert_task_structure(messages: list[str], tmp_path=None) -> None:
+    """
+    Checks the structure of logged messages: a task starts as "<Task>..."
+    and ends as exactly "<Task> completed." (tasks may nest), every other
+    message is one sentence ending in "." (not "..."), results are rows of
+    their own instead of being folded into the completion row, and no
+    message is longer than 100 characters (a temporary path counts as one
+    short word).
+    """
+    open_tasks = []
+    for message in messages:
+        short = message.replace(str(tmp_path), "<tmp>") if tmp_path else message
+        assert len(short) <= 100, message
+        if message.endswith("..."):
+            open_tasks.append(message[:-len("...")])
+        elif open_tasks and message == f"{open_tasks[-1]} completed.":
+            open_tasks.pop()
+        else:
+            assert message.endswith("."), message
+            assert " completed" not in message, message
+    assert open_tasks == [], f"tasks without a completion row: {open_tasks}"
+
+
+class TestLogMessages:
+    """Every task logged as "<Task>..." ends with "<Task> completed."."""
+
+    def test_loading_the_model(self, tmp_path, model_config_data, monkeypatch, logged):
+        model_config_data.update({"metadata_folder": str(tmp_path / "logs"), "device": "cpu"})
+        _fake_engine(monkeypatch)
+
+        Model(config=model_config_data)
+
+        assert "Loading model at index 0: 'dummy/model-a' completed." in logged
+        _assert_task_structure(logged, tmp_path)
+
+    def test_adding_a_prompt_from_file(self, tmp_path, bare_model, logged):
+        prompt_dir = tmp_path / "prompts"
+        prompt_dir.mkdir()
+        (prompt_dir / "prompt_a.md").write_text("Hello", encoding="utf-8")
+        bare_model.config.prompt_folder = str(prompt_dir)
+        bare_model.config.prompt_files = ["prompt_a.md"]
+
+        bare_model.addPromptFromFile(index=0, amount=2)
+
+        assert logged[-1] == "Loading prompt from file 'prompt_a.md' completed."
+        _assert_task_structure(logged, tmp_path)
+
+    def test_generating_in_chunks_with_skipped_shared_and_stored_answers(self, tmp_path, bare_model, logged):
+        bare_model.llm = FakeLLM()
+        bare_model.config.chunk_size = 2
+        bare_model.config.max_model_len = 10
+        bare_model.addPrompt(userRole, ["a", "b"])
+        bare_model.generate()
+
+        run = _new_run(bare_model)
+        run.addPrompt(userRole, ["a", "c", "d", "c", "z" * 20])
+        run.generate()
+
+        assert "Generating answers for 5 histories completed." in logged
+        _assert_task_structure(logged, tmp_path)
+
+    def test_generating_only_stored_answers(self, tmp_path, bare_model, logged):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["a"])
+        bare_model.generate()
+
+        run = _new_run(bare_model)
+        run.addPrompt(userRole, ["a"])
+        run.generate()
+
+        assert logged[-1] == "Generating answers for 1 histories completed."
+        _assert_task_structure(logged, tmp_path)
+
+
 # --- Package exports -------------------------------------------------------------------
 
 class TestPackageExports:

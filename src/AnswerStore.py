@@ -186,7 +186,10 @@ class AnswerStore:
                 f"The answers in '{self.path}' were generated with other settings ({details}). "
                 f"Delete the file or use another one (prompt_tmp_file or setPostfix())."
             )
-            Logger().log(message)
+            # Logged as short rows; the exception keeps the whole message
+            Logger().log(f"The answers in '{self.path}' were generated with other settings.")
+            Logger().log(f"Differing settings: {details}.")
+            Logger().log("Delete the file or use another one (prompt_tmp_file or setPostfix()).")
             raise ValueError(message)
 
         return data.get(historiesKey, {})

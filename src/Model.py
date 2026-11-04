@@ -203,7 +203,7 @@ class Model:
         )
 
         # --- Step 5: Initialize the vLLM Engine ---
-        l.log("Loading model...")
+        l.log(f"Loading model into {device}...")
         
         self.llm = LLM(
             model=model,
@@ -240,6 +240,8 @@ class Model:
             self.close()
             raise
 
+        l.log(f"Loading model at index {index}: '{model}' completed.")
+
     @staticmethod
     def _resolveConfig(
         config: str | os.PathLike | dict | ModelConfig,
@@ -271,7 +273,7 @@ class Model:
 
         path = os.fspath(config)
         if not Path(path).is_file():
-            Logger().log(f"Config file not found at '{path}'")
+            Logger().log(f"Config file not found at '{path}'.")
             raise FileNotFoundError(f"Config file not found at '{path}'")
 
         # An empty file parses to None, so fall back to an empty dict to get
@@ -445,7 +447,7 @@ class Model:
 
         # Guard Clause: Validate prompt file index bounds
         if not (0 <= index < len(self.config.prompt_files)):
-            l.log(f"Invalid prompt index: {index}")
+            l.log(f"Invalid prompt index: {index}.")
             raise IndexError(
                 f"Prompt index {index} out of range for config.prompt_files "
                 f"({len(self.config.prompt_files)} entries)."
@@ -486,6 +488,7 @@ class Model:
         # Add prompt to history and capture return count
         ret = self.addPrompt(userRole, prompts)
         l.log(f"Added the prompt to {ret} histories.")
+        l.log(f"Loading prompt from file '{file_name}' completed.")
         return ret
 
     def formatPromptFromFile(self, index: int, values: dict) -> int:
@@ -516,10 +519,10 @@ class Model:
         try:
             formatted_prompt = raw_template.format(**values)
         except KeyError as e:
-            l.log(f"Missing template placeholder key in values dict: {e}")
+            l.log(f"Missing template placeholder key in values dict: {e}.")
             raise
         except (ValueError, IndexError) as e:
-            l.log(f"Failed to format prompt template at history {index}: {e}")
+            l.log(f"Failed to format prompt template at history {index}: {str(e).rstrip('.')}.")
             raise ValueError(f"Malformed prompt template at history {index}: {e}") from e
 
         # Step 2: Update the message content in-place. `message` is the very
@@ -601,6 +604,7 @@ class Model:
 
         started = datetime.now().astimezone().isoformat(timespec="seconds")
         run_start = time.perf_counter()
+        l.log(f"Generating answers for {len(unprocessed_indices)} histories...")
 
         # 2. Use the stored answers
         missing_indices = []
@@ -654,8 +658,9 @@ class Model:
             # Number of chunks, i.e. total / chunk_size rounded up
             chunk_count = -(-total // chunk_size)
 
-            l.log(f"Starting generation for {total} unprocessed histories in {chunk_count} chunk(s) of up to {chunk_size}"
-                  + (f" ({shared} identical histories get the same answers)" if shared else "") + "...")
+            l.log(f"{total} histories to generate in {chunk_count} chunk(s) of up to {chunk_size}.")
+            if shared:
+                l.log(f"{shared} identical histories get the same answers.")
 
             done = 0
 
@@ -673,7 +678,11 @@ class Model:
                 chunk_output_tokens = 0
 
                 if batch_indices:
-                    l.log(f"Running vLLM generation for chunk {chunk_number}/{chunk_count} [Indices {batch_indices[0]} to {batch_indices[-1]}]...")
+                    chunk_task = (
+                        f"Running vLLM generation for chunk {chunk_number}/{chunk_count} "
+                        f"[Indices {batch_indices[0]} to {batch_indices[-1]}]"
+                    )
+                    l.log(f"{chunk_task}...")
 
                     # Run batched generation over the chat histories
                     results = self.llm.chat(
@@ -715,6 +724,8 @@ class Model:
                         # Identical histories share their nodes in the store
                         store.add(self.messageHistories[idx])
 
+                    l.log(f"{chunk_task} completed.")
+
                     # 6. Store the answers after every chunk, so a killed job
                     # (e.g. by a Slurm time limit) loses at most one chunk of work
                     store.save()
@@ -747,20 +758,21 @@ class Model:
         # are in skippedHistories and truncatedHistories.
         if self.skippedHistories:
             l.log(f"Skipped {len(self.skippedHistories)} histories whose prompt exceeds "
-                  f"max_model_len: {_firstIndexes(self.skippedHistories)}")
+                  f"max_model_len: {_firstIndexes(self.skippedHistories)}.")
         if self.truncatedHistories:
             l.log(f"{len(self.truncatedHistories)} answers were cut off at max_tokens "
-                  f"({self.config.max_tokens}): {_firstIndexes(self.truncatedHistories)}")
+                  f"({self.config.max_tokens}): {_firstIndexes(self.truncatedHistories)}.")
         if reasoning_tokens:
             l.log(f"Of the generated tokens, about {reasoning_tokens} were reasoning.")
         l.log(
-            f"Generation completed: {generated} answers generated, {reused} stored and "
+            f"{generated} answers generated, {reused} stored and "
             f"{shared} shared with identical histories."
         )
         l.log(
             f"{prompt_tokens} prompt and {output_tokens} generated tokens in "
             f"{_duration(elapsed)} ({_rate(output_tokens, elapsed)} generated tokens/s)."
         )
+        l.log(f"Generating answers for {len(unprocessed_indices)} histories completed.")
 
         # 8. Record the statistics of this call in the run metadata
         self.generationStats.append({
@@ -920,7 +932,7 @@ class Model:
             try:
                 gpu_names.append(torch.cuda.get_device_name(gpu_index))
             except Exception as e:
-                Logger().log(f"Could not read the name of GPU {gpu_index}: {e!r}")
+                Logger().log(f"Could not read the name of GPU {gpu_index}: {e!r}.")
                 gpu_names.append(None)
 
         prompt_hashes = {
@@ -1285,7 +1297,7 @@ class Model:
             try:
                 step()
             except Exception as e:
-                Logger().log(f"close(): {name} failed: {e!r}")
+                Logger().log(f"close(): {name} failed: {e!r}.")
 
         gc.collect()
         if torch.cuda.is_available():

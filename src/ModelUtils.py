@@ -179,8 +179,8 @@ def modelRevision(model_id: str) -> Optional[str]:
         # Cached snapshots live in .../snapshots/<commit hash>
         return os.path.basename(os.path.normpath(snapshot))
     except Exception as e:
-        Logger().log(f"Could not determine the revision of model '{model_id}':")
-        Logger().log(f"{e!r}")
+        Logger().log(f"Could not determine the revision of model '{model_id}'.")
+        Logger().log(f"Reason: {e!r}.")
         return None
 
 
