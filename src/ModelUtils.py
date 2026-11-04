@@ -4,6 +4,7 @@ from logger     import Logger, lockedFile, makeParentFolder, writeJSON
 import hashlib
 import json
 import os
+import textwrap
 
 # Chat message roles, as the chat templates expect them
 systemRole      = "system"
@@ -126,6 +127,18 @@ def packageVersions(packages: list[str]) -> dict[str, Optional[str]]:
     return versions
 
 
+def describeError(e: BaseException, width: int = 90) -> str:
+    """
+    An exception as "<type>: <message>" of at most about `width` characters
+    for one log row, the message cut at a word (library messages can be very
+    long).
+    """
+    name = type(e).__name__
+    message = textwrap.shorten(str(e).rstrip("."), width=max(width - len(name) - 2, 20),
+                               placeholder=" (...)")
+    return f"{name}: {message}" if message else name
+
+
 def modelRevision(model_id: str) -> Optional[str]:
     """
     Returns the Hugging Face commit hash of the locally cached snapshot of
@@ -144,7 +157,7 @@ def modelRevision(model_id: str) -> Optional[str]:
         return os.path.basename(os.path.normpath(snapshot))
     except Exception as e:
         Logger().log(f"Could not determine the revision of model '{model_id}'.")
-        Logger().log(f"Reason: {e!r}.")
+        Logger().log(f"Reason: {describeError(e)}.")
         return None
 
 

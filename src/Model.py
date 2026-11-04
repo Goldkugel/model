@@ -17,6 +17,7 @@ from .ModelUtils        import (
     metadataPackages,
     packageVersions,
     modelRevision,
+    describeError,
     fileSHA256,
     target_device,
 )
@@ -473,7 +474,8 @@ class Model:
             l.log(f"Missing template placeholder key in values dict: {e}.")
             raise
         except (ValueError, IndexError) as e:
-            l.log(f"Failed to format prompt template at history {index}: {str(e).rstrip('.')}.")
+            l.log(f"Failed to format prompt template at history {index}.")
+            l.log(f"Reason: {describeError(e)}.")
             raise ValueError(f"Malformed prompt template at history {index}: {e}") from e
 
         # `message` is the dict stored in the history, so no write-back needed
@@ -841,7 +843,8 @@ class Model:
             try:
                 gpu_names.append(torch.cuda.get_device_name(gpu_index))
             except Exception as e:
-                Logger().log(f"Could not read the name of GPU {gpu_index}: {e!r}.")
+                Logger().log(f"Could not read the name of GPU {gpu_index}.")
+                Logger().log(f"Reason: {describeError(e)}.")
                 gpu_names.append(None)
 
         prompt_hashes = {
@@ -1193,7 +1196,8 @@ class Model:
             try:
                 step()
             except Exception as e:
-                Logger().log(f"close(): {name} failed: {e!r}.")
+                Logger().log(f"close(): {name} failed.")
+                Logger().log(f"Reason: {describeError(e)}.")
 
         gc.collect()
         if torch.cuda.is_available():
