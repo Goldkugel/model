@@ -986,7 +986,8 @@ class Model:
 
         self.postfix = postfix
         self.store = None
-        Logger().log(f"Checkpoint: '{self._checkpointPath()}', prompt log: '{self._promptLogPath()}'.")
+        Logger().log(f"Checkpoint: '{self._checkpointPath()}'.")
+        Logger().log(f"Prompt log: '{self._promptLogPath()}'.")
 
     def hasCheckpoint(self) -> bool:
         """
