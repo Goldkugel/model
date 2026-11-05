@@ -76,7 +76,7 @@ def fileStamp(path: str) -> Optional[tuple[int, int, int]]:
     """
     Returns (inode, size, modification time) of the file at `path`, or None
     if it does not exist. Every write of another process changes the stamp:
-    writeAtomically() replaces the file, which gives it a new inode.
+    writeJSON() replaces the file atomically, which gives it a new inode.
     """
     try:
         stat = os.stat(path)
@@ -130,12 +130,13 @@ def packageVersions(packages: list[str]) -> dict[str, Optional[str]]:
 def describeError(e: BaseException, width: int = 90) -> str:
     """
     An exception as "<type>: <message>" of at most about `width` characters
-    for one log row, the message cut at a word (library messages can be very
-    long).
+    for one log row (library messages can be very long); a cut message ends
+    at a word, followed by " (...)".
     """
     name = type(e).__name__
     message = " ".join(str(e).split())
     if len(name) + 2 + len(message) > width:
+        # Room for ": " and " (...)"
         message = textwrap.shorten(message.rstrip("."), width=max(width - len(name) - 8, 10),
                                    placeholder="")
         # A parenthesis the cut leaves open is dropped with the rest.
@@ -148,10 +149,11 @@ def describeError(e: BaseException, width: int = 90) -> str:
 def modelRevision(model_id: str, configured: Optional[str] = None) -> Optional[str]:
     """
     Returns the Hugging Face revision of `model_id` that vLLM loads: the
-    configured one (config.revision), otherwise the commit hash of the
-    locally cached snapshot. Returns None for a local model directory, or if
-    no cached version is found; the latter is logged, since the run metadata
-    then lacks the model version.
+    configured one (config.revision), otherwise the commit of the locally
+    cached snapshot, or of the cache's refs/main (see cachedRevision()).
+    Returns None for a local model directory, or if no cached version is
+    found; the latter is logged, since the run metadata then lacks the model
+    version.
     """
     if configured:
         return configured

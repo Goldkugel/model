@@ -122,7 +122,8 @@ class Model:
         self.modelIndex: int = index
         self.gpuCount: int = 0
         self.generationStats: list[dict] = []
-        # The checkpoint, loaded by the first generate(); see _answerStore()
+        # The answer store (the checkpoint), loaded by the first generate();
+        # see _answerStore()
         self.store: Optional[AnswerStore] = None
         # Looked up once by _modelRevision()
         self.revision: Optional[str] = None
@@ -188,7 +189,8 @@ class Model:
         
         self.llm = LLM(
             model=model,
-            # None loads the cached or the latest version.
+            # The pinned commit of llm.revision for model and tokenizer; None
+            # loads the latest (or, offline, the cached) version.
             revision=self.config.revision.get(model),
             tokenizer_revision=self.config.revision.get(model),
             tensor_parallel_size=gpus,
@@ -1164,7 +1166,8 @@ class Model:
 
     def reset(self) -> None:
         """
-        Clears all active conversation histories and resets state.
+        Clears all histories and the lists of skipped and truncated ones; the
+        answer store and the run statistics are kept.
         """
         self.messageHistories = []
         self.skippedHistories = []

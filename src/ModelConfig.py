@@ -17,9 +17,10 @@ class ModelConfig(BaseModel):
         description="List of HuggingFace or local model repository identifiers."
     )
 
-    # The Hugging Face commit of a model ID, so that a run always loads the
-    # same model version; a model without an entry loads the cached or latest
-    # one. The run metadata records the revision either way.
+    # The Hugging Face commit of a model ID, passed to vLLM as revision and
+    # tokenizer_revision, so that a run always loads the same model version;
+    # a model without an entry loads the latest (or cached) one. The run
+    # metadata records the revision either way.
     revision: dict[str, str] = Field(
         default_factory=dict,
         description="Hugging Face commit (or tag) per model ID of model_id."

@@ -151,6 +151,7 @@ class AnswerStore:
         # fileStamp() of the file as this store last read or wrote it, to
         # notice writes of other runs (see save())
         self.stamp: Optional[tuple] = None
+        # Whether add() stored something since the last save()
         self.changed: bool = False
 
     def _read(self) -> dict:

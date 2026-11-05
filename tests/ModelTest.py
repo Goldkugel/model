@@ -57,14 +57,11 @@ def model_config_data() -> dict:
 @pytest.fixture
 def bare_model(model_config_data, tmp_path) -> Model:
     """
-    A Model instance with a validated config but without an actual vLLM
-    engine loaded.
+    A Model with a validated config but no vLLM engine (llm is None).
 
-    Model.__init__ requires a real GPU, so tests that only exercise history
-    management (addPrompt, toJSON, the answer store, ...) construct the object
-    via __new__ (bypassing __init__) and set up just the state those methods
-    rely on -- config, messageHistories and the run metadata fields, with
-    llm left as None. Tests of generate() assign a FakeLLM.
+    Model.__init__ requires a GPU, so the object is built via __new__ with
+    just the state the other methods rely on. Tests of generate() assign a
+    FakeLLM.
     """
     model = Model.__new__(Model)
     model.config = ModelConfig.model_validate(model_config_data)
@@ -205,6 +202,7 @@ def _fake_engine(monkeypatch, gpus: int = 1) -> dict:
 # --- ModelConfig --------------------------------------------------------------
 
 class TestModelConfig:
+    """Defaults and validation of ModelConfig."""
 
     def test_config_initializes_with_expected_defaults(self):
         config = ModelConfig()
@@ -496,6 +494,7 @@ class TestModelConstructorGuards:
 # --- Model.addPrompt -----------------------------------------------------------
 
 class TestAddPrompt:
+    """The three cases of addPrompt(): new histories, broadcast, one message per history."""
 
     def test_initializes_new_histories_from_empty(self, bare_model):
         count = bare_model.addPrompt(userRole, ["prompt a", "prompt b"])
@@ -541,6 +540,7 @@ class TestAddPrompt:
 
 
 class TestAddPromptValidation:
+    """Inputs addPrompt() rejects without adding anything."""
 
     def test_a_string_instead_of_a_list_raises(self, bare_model):
         # It used to be split into one history per character
@@ -582,6 +582,7 @@ class TestAddPromptValidation:
 # --- Model.addPromptFromFile ----------------------------------------------------
 
 class TestAddPromptFromFile:
+    """Loading a prompt template with addPromptFromFile()."""
 
     def test_loads_prompt_and_initializes_histories(self, tmp_path, bare_model):
         prompt_dir = tmp_path / "prompts"
@@ -637,6 +638,7 @@ class TestAddPromptFromFile:
 # --- Model.formatPromptFromFile -------------------------------------------------
 
 class TestFormatPromptFromFile:
+    """Filling placeholders with formatPromptFromFile()."""
 
     def test_formats_placeholders_in_last_message(self, bare_model):
         bare_model.addPrompt(userRole, ["Hello {name}, you are {age}"])
@@ -669,6 +671,7 @@ class TestFormatPromptFromFile:
 # --- Model.toJSON ----------------------------------------------------------------
 
 class TestToJSON:
+    """Parsing the last answer of a history with toJSON()."""
 
     def test_extracts_json_from_markdown_code_block(self, bare_model):
         bare_model.addPrompt(userRole, ["classify this"])
@@ -738,6 +741,7 @@ class TestToJSON:
 # --- Model.reset / getMessageHistories --------------------------------------------
 
 class TestResetAndGetMessageHistories:
+    """reset() and getMessageHistories()."""
 
     def test_reset_clears_histories(self, bare_model):
         bare_model.addPrompt(userRole, ["a"])
@@ -749,6 +753,7 @@ class TestResetAndGetMessageHistories:
 # --- Model.getModelName ---------------------------------------------------------------
 
 class TestGetModelName:
+    """getModelName(): the model ID without the organisation."""
 
     @pytest.mark.parametrize("model_id, name", [
         ("google/medgemma-4b-it", "medgemma-4b-it"),
@@ -774,6 +779,7 @@ class TestGetModelName:
 # --- Model.getModelCount --------------------------------------------------------------
 
 class TestGetModelCount:
+    """getModelCount(), which reads the config without loading a model."""
 
     def test_counts_the_models_of_a_config_file(self, tmp_path, model_config_data):
         path = _write_yaml_config(tmp_path, model_config_data)
@@ -800,6 +806,7 @@ class TestGetModelCount:
 # --- Model.setPostfix / hasCheckpoint ------------------------------------------------
 
 class TestFileNames:
+    """File names with model name and postfix (setPostfix(), hasCheckpoint())."""
 
     def test_file_names_contain_the_model_name(self, bare_model):
         assert os.path.basename(bare_model._checkpointPath()) == "raw_model-a.tmp"
@@ -863,6 +870,7 @@ class TestFileNames:
 # --- Model.getTurnCount / getPrompt / getAnswer --------------------------------------
 
 class TestTurns:
+    """getTurnCount(), getPrompt() and getAnswer()."""
 
     def test_turn_count_without_histories_is_zero(self, bare_model):
         assert bare_model.getTurnCount() == 0
@@ -894,6 +902,7 @@ class TestTurns:
 # --- Model.addPromptsFromFile ---------------------------------------------------------
 
 class TestAddPromptsFromFile:
+    """addPromptsFromFile(): one template, one dict of values per history."""
 
     @pytest.fixture
     def templated_model(self, bare_model, tmp_path):
@@ -931,11 +940,10 @@ class TestAddPromptsFromFile:
 # --- Model.generate ------------------------------------------------------------------
 
 class TestGenerate:
+    """generate(): chunks, skipped prompts and the answer store file."""
 
     def test_returns_immediately_when_no_prompts(self, bare_model):
-        # self.llm is None; if the empty-history guard clause didn't
-        # short-circuit, this would raise AttributeError on
-        # self.llm.get_tokenizer() instead of returning cleanly.
+        # self.llm is None, so getting past the guard clause would raise
         assert bare_model.generate() == 0
 
     def test_answers_unanswered_histories_in_chunks(self, bare_model):
@@ -1007,6 +1015,7 @@ class BatchEncodingTokenizer(FakeTokenizer):
 
 
 class TestGenerateResumeAndTurns:
+    """Resuming an interrupted generate() and multi-turn conversations."""
 
     def test_resumes_from_the_checkpoint_after_an_interruption(self, bare_model):
         bare_model.config.chunk_size = 2
@@ -1380,6 +1389,7 @@ class TestAnswerStore:
 
 
 class TestCutOffAnswers:
+    """Answers cut off at max_tokens."""
 
     def test_cut_off_reasoning_opened_by_the_template_is_no_answer(self, bare_model):
         # DeepSeek-R1-style: the template ends the prompt with <think>, so the
@@ -1440,6 +1450,7 @@ class TestCutOffAnswers:
 # --- Thinking models ------------------------------------------------------------
 
 class TestSplitReasoning:
+    """_splitReasoning() for thinking and non-thinking models."""
 
     @pytest.mark.parametrize("text, expected", [
         # Qwen3: reasoning in <think> tags before the answer
@@ -1474,6 +1485,7 @@ class TestSplitReasoning:
 
 
 class TestGenerateWithThinkingModels:
+    """generate() with the reasoning of thinking models."""
 
     def test_stores_reasoning_separately_from_the_answer(self, bare_model):
         bare_model.llm = FakeThinkingLLM()
@@ -1584,6 +1596,7 @@ class TestGenerateWithThinkingModels:
 # --- Model._writeRunMetadata ----------------------------------------------------------
 
 class TestRunMetadata:
+    """The run metadata file written by _writeRunMetadata()."""
 
     def test_records_prompt_hashes_and_package_versions(self, tmp_path, bare_model):
         (tmp_path / "prompt_a.md").write_text("Hello", encoding="utf-8")
@@ -1639,6 +1652,7 @@ class TestRunMetadata:
 # --- Model.logPrompts --------------------------------------------------------------
 
 class TestLogPrompts:
+    """Writing the prompt log with logPrompts()."""
 
     def test_writes_log_file_at_configured_path(self, tmp_path, bare_model):
         bare_model.config.prompt_log_folder = str(tmp_path) + os.sep
@@ -1655,6 +1669,7 @@ class TestLogPrompts:
 # --- Model.close / context manager -------------------------------------------------
 
 class TestClose:
+    """close(), the context manager and __del__."""
 
     def test_close_is_safe_to_call_without_a_loaded_llm(self, bare_model):
         bare_model.close()  # must not raise even though self.llm is None
@@ -1732,6 +1747,7 @@ class TestClose:
 # --- ModelUtils.writePrompt ---------------------------------------------------------
 
 class TestWritePrompt:
+    """The semicolon-delimited prompt log of writePrompt()."""
 
     def test_writes_header_and_expected_row_count(self, tmp_path):
         histories = [
@@ -1762,9 +1778,10 @@ class TestWritePrompt:
         assert content.count("\n") == 2  # header + one data row
 
 
-# --- ModelUtils: atomic writes and run metadata helpers ------------------------------
+# --- ModelUtils: atomic writes, run metadata helpers and errors ----------------------
 
 class TestModelUtils:
+    """Helpers of ModelUtils: writeJSON(), packageVersions(), modelRevision(), describeError()."""
 
     def test_failed_write_keeps_the_previous_file(self, tmp_path):
         path = str(tmp_path / "data.json")
@@ -1912,6 +1929,7 @@ class TestLogMessages:
 # --- Package exports -------------------------------------------------------------------
 
 class TestPackageExports:
+    """What the model package exports."""
 
     def test_every_exported_name_is_importable(self):
         assert set(model_package.__all__) == {
