@@ -36,7 +36,6 @@ import contextlib
 import gc
 import torch
 import yaml
-import json
 import re
 
 logging.getLogger("vllm").setLevel(logging.ERROR)
@@ -140,11 +139,11 @@ class Model:
             l = Logger(logger_path)
         else:
             if Logger.config is None and logger_settings is not None:
-                Logger.config = LoggerConfig.model_validate(logger_settings)
+                Logger(LoggerConfig.model_validate(logger_settings))
             l = Logger()
 
         if not (0 <= index < len(self.config.model_id)):
-            l.log(f"No model specified or index {index} out of range.")
+            l.log(f"No model specified or index {index} out of range.", level="error")
             raise ValueError(
                 f"Index {index} out of range for config.model_id "
                 f"({len(self.config.model_id)} entries)."
@@ -156,7 +155,7 @@ class Model:
 
         device = self.config.device
         if device == cpu:
-            l.log("WARNING: device 'cpu' is not supported yet; the model is loaded on the GPU.")
+            l.log("Device 'cpu' is not supported yet; the model is loaded on the GPU.", level="warning")
         l.log(f"Scanning device '{device}'...")
 
         # Fail before vLLM starts, whose error would be far less readable.
@@ -164,7 +163,7 @@ class Model:
         l.log(f"Cuda available: {cuda_ok}.")
 
         if not cuda_ok:
-            l.log("No GPU available.")
+            l.log("No GPU available.", level="error")
             raise RuntimeError("No GPU available: CUDA is not accessible to PyTorch.")
 
         gpus = torch.cuda.device_count()
@@ -172,7 +171,7 @@ class Model:
         l.log(f"GPU Amount: {gpus}.")
 
         if gpus == 0:
-            l.log("No GPU visible.")
+            l.log("No GPU visible.", level="error")
             raise RuntimeError("No GPU visible despite CUDA being reported as available.")
 
         l.log(f"Scanning device '{device}' completed.")
@@ -186,27 +185,35 @@ class Model:
         )
 
         l.log(f"Loading model into {device}...")
-        
-        self.llm = LLM(
-            model=model,
-            # The pinned commit of llm.revision for model and tokenizer; None
-            # loads the latest (or, offline, the cached) version.
-            revision=self.config.revision.get(model),
-            tokenizer_revision=self.config.revision.get(model),
-            tensor_parallel_size=gpus,
-            enforce_eager=self.config.enforce_eager,
-            max_model_len=self.config.max_model_len,
-            max_num_batched_tokens=self.config.max_num_batched_tokens,
-            seed=self.config.seed,
-            gpu_memory_utilization=self.config.gpu_memory_utilization,
-            dtype=self.config.dtype,
-            quantization=self.config.quantization,
-            enable_prefix_caching=self.config.enable_prefix_caching,
-            # Mixture-of-Experts models shard their experts across the GPUs
-            enable_expert_parallel=any(
-                pattern in model for pattern in self.config.expert_parallel_models
-            ),
-        )
+
+        try:
+            self.llm = LLM(
+                model=model,
+                # The pinned commit of llm.revision for model and tokenizer; None
+                # loads the latest (or, offline, the cached) version.
+                revision=self.config.revision.get(model),
+                tokenizer_revision=self.config.revision.get(model),
+                tensor_parallel_size=gpus,
+                enforce_eager=self.config.enforce_eager,
+                max_model_len=self.config.max_model_len,
+                max_num_batched_tokens=self.config.max_num_batched_tokens,
+                seed=self.config.seed,
+                gpu_memory_utilization=self.config.gpu_memory_utilization,
+                dtype=self.config.dtype,
+                quantization=self.config.quantization,
+                enable_prefix_caching=self.config.enable_prefix_caching,
+                # Mixture-of-Experts models shard their experts across the GPUs
+                enable_expert_parallel=any(
+                    pattern in model for pattern in self.config.expert_parallel_models
+                ),
+            )
+        except Exception:
+            # vLLM may have started worker processes and taken GPU memory
+            # before it failed (e.g. out of memory); the caller gets no Model
+            # to close(), and the next Model would find the GPUs taken.
+            l.log(f"Loading model into {device} failed; releasing the GPUs.", level="error")
+            self.close()
+            raise
 
         l.log(f"Loading model into {device} completed.")
 
@@ -215,7 +222,7 @@ class Model:
         try:
             self._writeRunMetadata()
         except Exception:
-            l.log("Writing the run metadata failed; releasing the loaded model.")
+            l.log("Writing the run metadata failed; releasing the loaded model.", level="error")
             self.close()
             raise
 
@@ -230,8 +237,8 @@ class Model:
 
         Returns the ModelConfig, the YAML file it came from if that file has
         a "logger" section (or None), and the "logger" section of a full
-        configuration dict (or None), so __init__ can configure the Logger
-        from the same source.
+        configuration dict ({} for an empty one, None if there is none), so
+        __init__ can configure the Logger from the same source.
 
         :raises FileNotFoundError: If the config file does not exist.
         :raises KeyError: If the config file has no "llm" section.
@@ -245,12 +252,15 @@ class Model:
             # setting itself, so the two kinds cannot be confused.
             if configuration_section in config:
                 section = config[configuration_section] or {}
-                return ModelConfig.model_validate(section), None, config.get(logger_section)
+                # An empty logger section (None) means the Logger's defaults,
+                # as in a YAML file.
+                logger_settings = (config[logger_section] or {}) if logger_section in config else None
+                return ModelConfig.model_validate(section), None, logger_settings
             return ModelConfig.model_validate(config), None, None
 
         path = os.fspath(config)
         if not Path(path).is_file():
-            Logger().log(f"Config file not found at '{path}'.")
+            Logger().log(f"Config file not found at '{path}'.", level="error")
             raise FileNotFoundError(f"Config file not found at '{path}'")
 
         # An empty file parses to None; {} gives the clearer error below.
@@ -291,7 +301,7 @@ class Model:
 
         # Otherwise "hello" would be added as five messages "h", "e", ...
         if isinstance(message, str):
-            l.log("addPrompt: message is a string, not a list of strings.")
+            l.log("addPrompt: message is a string, not a list of strings.", level="error")
             raise TypeError("addPrompt: 'message' must be a list of strings, not a string.")
 
         # Other roles (e.g. Gemini's "model") are not understood by the chat
@@ -299,7 +309,7 @@ class Model:
         # prompts.
         if message and role not in chatRoles:
             error = f"addPrompt: unknown role '{role}'; expected one of {list(chatRoles)}."
-            l.log(error)
+            l.log(error, level="error")
             raise ValueError(error)
 
         # An empty answer (a thinking model cut off during its reasoning) is
@@ -314,7 +324,7 @@ class Model:
                     f"addPrompt: histories {empty} end with an empty answer; "
                     f"call generate() again (with a larger max_tokens) first."
                 )
-                l.log(error)
+                l.log(error, level="error")
                 raise ValueError(error)
 
         # The answer store pairs every answer with the prompt before it, so an
@@ -328,7 +338,7 @@ class Model:
             if not self.messageHistories or without_prompt:
                 where = f"histories {without_prompt}" if without_prompt else "a new history"
                 error = f"addPrompt: an answer must follow a user prompt, which {where} lack."
-                l.log(error)
+                l.log(error, level="error")
                 raise ValueError(error)
 
         # Case 1: broadcast
@@ -361,7 +371,7 @@ class Model:
                 f"addPrompt: message count ({len(message)}) does not match "
                 f"active history count ({len(self.messageHistories)})."
             )
-            l.log(error)
+            l.log(error, level="error")
             raise ValueError(error)
 
         return len(self.messageHistories)
@@ -374,7 +384,7 @@ class Model:
             (negative indices included, unlike plain list indexing).
         """
         if not (0 <= index < len(self.messageHistories)):
-            Logger().log(f"History index {index} out of bounds.")
+            Logger().log(f"History index {index} out of bounds.", level="error")
             raise IndexError(
                 f"History index {index} out of range "
                 f"({len(self.messageHistories)} histories)."
@@ -413,25 +423,25 @@ class Model:
         l = Logger()
 
         if not (0 <= index < len(self.config.prompt_files)):
-            l.log(f"Invalid prompt index: {index}.")
+            l.log(f"Invalid prompt index: {index}.", level="error")
             raise IndexError(
                 f"Prompt index {index} out of range for config.prompt_files "
                 f"({len(self.config.prompt_files)} entries)."
             )
 
         if not self.config.prompt_folder:
-            l.log("No prompt folder specified in config.")
+            l.log("No prompt folder specified in config.", level="error")
             raise ValueError("No prompt folder specified in config.")
 
         file_name = self.config.prompt_files[index]
         file_path = Path(self.config.prompt_folder) / file_name
 
         if not file_path.is_file():
-            l.log(f"File '{file_name}' not found at {file_path}.")
+            l.log(f"File '{file_name}' not found at {file_path}.", level="error")
             raise FileNotFoundError(f"Prompt file '{file_name}' not found at {file_path}.")
 
         if len(self.messageHistories) == 0 and amount <= 0:
-            l.log("Histories empty and valid 'amount' not specified.")
+            l.log("Histories empty and valid 'amount' not specified.", level="error")
             raise ValueError("Histories are empty: 'amount' must be positive.")
 
         l.log(f"Loading prompt from file '{file_name}'...")
@@ -476,11 +486,11 @@ class Model:
         try:
             formatted_prompt = raw_template.format(**values)
         except KeyError as e:
-            l.log(f"Missing template placeholder key in values dict: {e}.")
+            l.log(f"Missing template placeholder key in values dict: {e}.", level="error")
             raise
         except (ValueError, IndexError) as e:
-            l.log(f"Failed to format prompt template at history {index}.")
-            l.log(f"Reason: {describeError(e)}.")
+            l.log(f"Failed to format prompt template at history {index}.", level="error")
+            l.log(f"Reason: {describeError(e)}.", level="error")
             raise ValueError(f"Malformed prompt template at history {index}: {e}") from e
 
         # `message` is the dict stored in the history, so no write-back needed
@@ -580,7 +590,7 @@ class Model:
         reasoning_tokens = 0
 
         if generate_indices and self.llm is None:
-            l.log("generate() called after close().")
+            l.log("generate() called after close().", level="error")
             raise RuntimeError("The model was closed with close(); create a new Model to generate.")
 
         if generate_indices:
@@ -849,8 +859,8 @@ class Model:
             try:
                 gpu_names.append(torch.cuda.get_device_name(gpu_index))
             except Exception as e:
-                Logger().log(f"Could not read the name of GPU {gpu_index}.")
-                Logger().log(f"Reason: {describeError(e)}.")
+                Logger().log(f"Could not read the name of GPU {gpu_index}.", level="warning")
+                Logger().log(f"Reason: {describeError(e)}.", level="warning")
                 gpu_names.append(None)
 
         prompt_hashes = {
@@ -1144,6 +1154,9 @@ class Model:
             and `values` does not have one dict per history.
         :raises IndexError: If `index` is out of range for config.prompt_files.
         :raises KeyError: If a dict has no value for a placeholder.
+        :raises ValueError: Also if the template is malformed. In this and the
+            KeyError case the histories are left as they were before the
+            call, so no history keeps an unfilled template.
         """
         if len(values) == 0:
             raise ValueError("No values given: one dict per history is needed.")
@@ -1153,9 +1166,20 @@ class Model:
                 f"one dict per history is needed."
             )
 
+        had_histories = len(self.messageHistories) > 0
         ret = self.addPromptFromFile(index, len(values))
-        for history_index, history_values in enumerate(values):
-            self.formatPromptFromFile(history_index, history_values)
+        try:
+            for history_index, history_values in enumerate(values):
+                self.formatPromptFromFile(history_index, history_values)
+        except (KeyError, ValueError):
+            # Remove the template again: generate() would otherwise send the
+            # histories before the failing one filled and the rest unfilled.
+            if had_histories:
+                for history in self.messageHistories:
+                    history.pop()
+            else:
+                self.messageHistories = []
+            raise
         return ret
 
     def getMessageHistories(self) -> list[list[dict]]:
@@ -1206,8 +1230,8 @@ class Model:
             try:
                 step()
             except Exception as e:
-                Logger().log(f"close(): {name} failed.")
-                Logger().log(f"Reason: {describeError(e)}.")
+                Logger().log(f"close(): {name} failed.", level="warning")
+                Logger().log(f"Reason: {describeError(e)}.", level="warning")
 
         gc.collect()
         if torch.cuda.is_available():

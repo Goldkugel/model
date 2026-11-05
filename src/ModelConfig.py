@@ -1,5 +1,5 @@
 from typing     import Literal, Optional
-from pydantic   import BaseModel, ConfigDict, Field
+from pydantic   import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 class ModelConfig(BaseModel):
     """
@@ -193,3 +193,26 @@ class ModelConfig(BaseModel):
         default_factory=lambda: ["Qwen3-30B"],
         description="Substrings of model_id that require enable_expert_parallel=True (e.g. MoE architectures)."
     )
+
+    @field_validator("model_id")
+    @classmethod
+    def _strip_model_ids(cls, value: list[str]) -> list[str]:
+        """Strip the model IDs, so they match the keys of revision."""
+        return [model_id.strip() for model_id in value]
+
+    @field_validator("revision")
+    @classmethod
+    def _strip_revisions(cls, value: dict[str, str]) -> dict[str, str]:
+        """Strip the model IDs and revisions, as the entries of model_id."""
+        return {model_id.strip(): revision.strip() for model_id, revision in value.items()}
+
+    @model_validator(mode="after")
+    def _check_revision_keys(self) -> "ModelConfig":
+        """
+        Reject revisions for models that are not in model_id, so a typo in a
+        model ID cannot silently leave the real model unpinned.
+        """
+        unknown = sorted(set(self.revision) - set(self.model_id))
+        if unknown:
+            raise ValueError(f"revision given for model(s) not in model_id: {unknown}")
+        return self

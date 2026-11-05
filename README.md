@@ -68,7 +68,7 @@ The tests do not need `vllm` and `torch`. To run them on a machine without a GPU
 
 ```bash
 pip install --no-deps -e .
-pip install "logger @ git+https://github.com/Goldkugel/logger.git@v1.5.0" "pydantic>=2" pyyaml pytest
+pip install "logger @ git+https://github.com/Goldkugel/logger.git@v1.7.0" "pydantic>=2" pyyaml pytest pytest-cov
 ```
 
 ## Configuration
@@ -111,7 +111,7 @@ llm:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `model_id` | `list[str]` | `[]` | HuggingFace or local model identifiers. `Model(index=N)` selects which entry to load. |
-| `revision` | `dict[str, str]` | `{}` | The Hugging Face commit (or tag) per model ID, so that a run always loads the same model version; a model without an entry loads the cached or latest version. |
+| `revision` | `dict[str, str]` | `{}` | The Hugging Face commit (or tag) per model ID, so that a run always loads the same model version; a model without an entry loads the cached or latest version. Every key must also appear in `model_id`, so a typo cannot leave a model unpinned; spaces around keys and values are removed. |
 | `seed` | `int` | `2898231092` | Seed for vLLM and every sampling request, for reproducible generation. |
 | `temperature` | `float` | `0.01` | Sampling temperature (`0.0`–`2.0`; 0 = greedy). |
 | `top_p` | `float` | `0.95` | Nucleus sampling probability mass (`>0`–`1.0`). |
@@ -287,11 +287,11 @@ All methods raise an exception on failure; none returns an error code:
 
 | Method | Raises |
 |---|---|
-| `Model()` | `FileNotFoundError` for a missing config file, `KeyError` if it has no `llm` section, `pydantic.ValidationError` for unknown keys or invalid values, `ValueError` for an invalid model index, `RuntimeError` if no CUDA device is visible |
+| `Model()` | `FileNotFoundError` for a missing config file, `KeyError` if it has no `llm` section, `pydantic.ValidationError` for unknown keys or invalid values, `ValueError` for an invalid model index, `RuntimeError` if no CUDA device is visible; if vLLM fails to start (e.g. out of GPU memory), the GPUs are released (as by `close()`) before its exception is passed on |
 | `addPrompt()` | `TypeError` if `message` is a string instead of a list; `ValueError` for an unknown role, if the number of messages is neither 1, nor the number of histories, nor used to create new histories, if a history ends with an empty answer, or if an answer (`"assistant"`) would not follow a user prompt |
 | `addPromptFromFile()` | `IndexError` for an invalid prompt index, `FileNotFoundError` for a missing prompt file, `ValueError` if `prompt_folder` is empty or `amount` is missing for empty histories |
 | `formatPromptFromFile()` | `IndexError` for an invalid history index, `KeyError` for a placeholder without a value, `ValueError` for a malformed template (e.g. an unescaped `{`) |
-| `addPromptsFromFile()` | As `addPromptFromFile()` and `formatPromptFromFile()`; `ValueError` if `values` is empty or does not have one dict per history |
+| `addPromptsFromFile()` | As `addPromptFromFile()` and `formatPromptFromFile()`; `ValueError` if `values` is empty or does not have one dict per history. If a template cannot be filled, the histories are left as they were before the call |
 | `generate()` | `ValueError` if the answer store is not one or was written with other settings, `RuntimeError` if there is something to generate but the model was closed with `close()` |
 | `getPrompt()`, `getAnswer()`, `getTurnCount()` | `IndexError` for an invalid history index or turn |
 | `setPostfix()` | `ValueError` if the postfix contains a path separator |
@@ -299,7 +299,7 @@ All methods raise an exception on failure; none returns an error code:
 
 `generate()` returns the number of answers it generated (not counting stored answers and copies for identical histories).
 
-Failures that do not stop a run are written to the log instead: a cleanup step of `close()` that fails, a model revision or GPU name that cannot be read for the run metadata (stored as `null`), and `device: "cpu"`.
+The errors above are also written to the log, with the level `error`. Failures that do not stop a run are only written to the log, as warnings: a cleanup step of `close()` that fails, a GPU name that cannot be read for the run metadata (stored as `null`), and `device: "cpu"`. A model revision that cannot be determined is logged as well (and stored as `null`).
 
 ### Run metadata
 
@@ -360,7 +360,7 @@ The test suite needs neither a GPU nor a downloaded model, nor `vllm` and `torch
 pytest -v
 ```
 
-`pytest` collects every `*Test.py` file in [`tests/`](./tests/README.md) (configured in `pyproject.toml`). Besides the methods of `Model`, the tests cover the answer store (resuming an interrupted run, reusing stored answers, refusing other settings, runs sharing a store), the GPU and logger set-up of the constructor and the helpers in `ModelUtils.py`. The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14 ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
+`pytest` collects every `*Test.py` file in [`tests/`](./tests/README.md) (configured in `pyproject.toml`). Besides the methods of `Model`, the tests cover the answer store (resuming an interrupted run, reusing stored answers, refusing other settings, runs sharing a store), the GPU and logger set-up of the constructor and the helpers in `ModelUtils.py`. The same tests run on GitHub Actions for every push and pull request, on Python 3.10, 3.11 and 3.14, and report the line and branch coverage in the job log and on the run's summary page ([`.github/workflows/tests.yml`](./.github/workflows/tests.yml)).
 
 ## License
 

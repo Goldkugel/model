@@ -19,7 +19,7 @@ Importing `model` sets the following environment variables, so that vLLM enumera
 
 `CUDA_VISIBLE_DEVICES` is not changed: `Model` uses every GPU it selects (e.g. the GPUs Slurm allocated to the job), or every GPU of the machine if it is not set.
 
-It also sets the `vllm` logger to `ERROR` to suppress vLLM's start-up output, and sets `sys.dont_write_bytecode = True`, so Python writes no `.pyc` files for the rest of the process.
+It also sets the `vllm` logger to `ERROR` to suppress vLLM's start-up output.
 
 ## Message histories
 

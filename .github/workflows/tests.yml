@@ -26,10 +26,10 @@ jobs:
         python-version: ["3.10", "3.11", "3.14"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -41,9 +41,20 @@ jobs:
           python -m pip install --no-deps .
           python -m pip install \
             "logger @ git+https://github.com/Goldkugel/logger.git@v1.7.0" \
-            "pydantic>=2" pyyaml pytest
+            "pydantic>=2" pyyaml pytest pytest-cov
 
       # Runs every *Test.py file in tests/ (see [tool.pytest.ini_options] in
-      # pyproject.toml).
-      - name: Run tests
-        run: python -m pytest -v
+      # pyproject.toml). --cov=model measures the installed package,
+      # --cov-branch both sides of every branch; term-missing lists what is
+      # not covered.
+      - name: Run tests with coverage
+        run: python -m pytest -v --cov=model --cov-branch --cov-report=term-missing
+
+      # Also show the coverage table on the run's summary page.
+      - name: Add coverage to job summary
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f .coverage ]; then
+            echo "### Coverage (Python ${{ matrix.python-version }})" >> "$GITHUB_STEP_SUMMARY"
+            python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          fi

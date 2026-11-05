@@ -94,6 +94,17 @@ def logged(monkeypatch) -> list[str]:
     return messages
 
 
+@pytest.fixture
+def logged_levels(monkeypatch) -> list[tuple[str, str]]:
+    """Records (message, level) of every Logger.log() call during the test."""
+    messages = []
+    monkeypatch.setattr(
+        Logger, "log",
+        lambda self, message, cmdline=True, level="info": messages.append((message, level)),
+    )
+    return messages
+
+
 def _checkpoint_path(model: Model) -> pathlib.Path:
     """Path of the checkpoint file of `model`."""
     return pathlib.Path(model._checkpointPath())
@@ -248,6 +259,19 @@ class TestModelConfig:
 
 # --- Configuration sources -----------------------------------------------------
 
+class TestModelConfigRevisions:
+    """llm.revision must name models of model_id."""
+
+    def test_revision_for_unknown_model_is_rejected(self):
+        with pytest.raises(ValidationError, match="not in model_id"):
+            ModelConfig(model_id=["org/model-a"], revision={"org/model-b": "abc123"})
+
+    def test_model_ids_and_revisions_are_stripped(self):
+        config = ModelConfig(model_id=[" org/model-a "], revision={" org/model-a ": " abc123 "})
+        assert config.model_id == ["org/model-a"]
+        assert config.revision == {"org/model-a": "abc123"}
+
+
 class TestModelConfigSources:
     """
     Model(config=...) accepts a YAML path, a dict (the whole configuration or
@@ -290,6 +314,10 @@ class TestModelConfigSources:
         assert config == ModelConfig.model_validate(model_config_data)
         assert logger_path is None
         assert logger_settings == logger_data
+
+    def test_empty_logger_section_in_a_dict_means_the_logger_defaults(self, model_config_data):
+        _, _, logger_settings = Model._resolveConfig({"llm": model_config_data, "logger": None})
+        assert logger_settings == {}
 
     def test_empty_section_in_a_dict_falls_back_to_defaults(self):
         config, _, _ = Model._resolveConfig({"llm": None})
@@ -393,6 +421,47 @@ class TestModelConstructorGuards:
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
         with pytest.raises(RuntimeError):
             Model(config=config_path, index=0)
+
+    def test_failing_engine_start_releases_the_gpus(
+        self, tmp_path, model_config_data, monkeypatch, logged_levels
+    ):
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        _fake_engine(monkeypatch)
+        calls = []
+
+        def fail(**kwargs):
+            raise RuntimeError("CUDA out of memory")
+
+        monkeypatch.setattr(model_module, "LLM", fail)
+        monkeypatch.setattr(model_module, "destroy_model_parallel", lambda: calls.append("parallel"))
+        monkeypatch.setattr(model_module, "destroy_distributed_environment", lambda: calls.append("env"))
+
+        with pytest.raises(RuntimeError, match="out of memory"):
+            Model(config=config_path, index=0)
+
+        assert calls == ["parallel", "env"]
+        assert ("Loading model into cuda failed; releasing the GPUs.", "error") in logged_levels
+
+    def test_guard_failures_are_logged_as_errors(
+        self, tmp_path, model_config_data, monkeypatch, logged_levels
+    ):
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        with pytest.raises(RuntimeError):
+            Model(config=config_path, index=0)
+
+        assert ("No GPU available.", "error") in logged_levels
+
+    def test_cpu_device_is_a_warning(self, tmp_path, model_config_data, monkeypatch, logged_levels):
+        model_config_data.update({"device": "cpu", "metadata_folder": str(tmp_path / "logs")})
+        config_path = _write_yaml_config(tmp_path, model_config_data)
+        _fake_engine(monkeypatch)
+
+        Model(config=config_path, index=0)
+
+        assert ("Device 'cpu' is not supported yet; the model is loaded on the GPU.",
+                "warning") in logged_levels
 
     def test_passes_engine_options_to_vllm_and_writes_metadata(
         self, tmp_path, model_config_data, monkeypatch
@@ -936,6 +1005,33 @@ class TestAddPromptsFromFile:
         with pytest.raises(KeyError):
             templated_model.addPromptsFromFile(0, [{"synonym": "a"}])
 
+    def test_failure_creates_no_histories(self, templated_model):
+        # The second dict lacks the placeholder; the first history must not
+        # stay behind with its filled template.
+        with pytest.raises(KeyError):
+            templated_model.addPromptsFromFile(0, [{"label": "A"}, {"synonym": "b"}])
+
+        assert templated_model.getMessageHistories() == []
+
+    def test_failure_leaves_existing_histories_unchanged(self, templated_model):
+        templated_model.addPromptsFromFile(0, [{"label": "A"}, {"label": "B"}])
+        templated_model.addPrompt(modelRole, ["x", "y"])
+        before = json.loads(json.dumps(templated_model.getMessageHistories()))
+
+        with pytest.raises(KeyError):
+            templated_model.addPromptsFromFile(1, [{"synonym": "a"}, {"label": "b"}])
+
+        assert templated_model.getMessageHistories() == before
+
+    def test_malformed_template_leaves_the_histories_unchanged(self, templated_model, tmp_path):
+        (tmp_path / "broken.md").write_text("Label: {label", encoding="utf-8")
+        templated_model.config.prompt_files = ["broken.md"]
+
+        with pytest.raises(ValueError, match="Malformed"):
+            templated_model.addPromptsFromFile(0, [{"label": "A"}])
+
+        assert templated_model.getMessageHistories() == []
+
 
 # --- Model.generate ------------------------------------------------------------------
 
@@ -1386,6 +1482,51 @@ class TestAnswerStore:
 
         with pytest.raises(ValueError, match="not an answer store"):
             bare_model.generate()
+
+
+class TestAnswerStoreMerge:
+    """
+    _merge() combines the trees of two runs sharing an answer store: turns
+    are only merged below equal answers, since they depend on them.
+    """
+
+    @staticmethod
+    def _node(prompt, answer=None, following=None):
+        node = {"role": "user", "prompt": prompt}
+        if answer is not None:
+            node["answer"] = {"text": answer}
+        if following is not None:
+            node["next"] = following
+        return node
+
+    def test_different_answers_keep_the_target_and_its_turns(self):
+        from model.AnswerStore import _merge
+        target = {"p": self._node("p", "mine", {"q": self._node("q", "after mine")})}
+        source = {"p": self._node("p", "theirs", {"r": self._node("r", "after theirs")})}
+
+        _merge(target, source)
+
+        assert target["p"]["answer"] == {"text": "mine"}
+        assert set(target["p"]["next"]) == {"q"}
+
+    def test_a_prompt_without_answer_takes_the_source_answer_and_turns(self):
+        from model.AnswerStore import _merge
+        target = {"p": self._node("p")}
+        source = {"p": self._node("p", "theirs", {"r": self._node("r", "next")})}
+
+        _merge(target, source)
+
+        assert target["p"]["answer"] == {"text": "theirs"}
+        assert set(target["p"]["next"]) == {"r"}
+
+    def test_equal_answers_merge_the_following_turns(self):
+        from model.AnswerStore import _merge
+        target = {"p": self._node("p", "same", {"q": self._node("q", "a")})}
+        source = {"p": self._node("p", "same", {"r": self._node("r", "b")})}
+
+        _merge(target, source)
+
+        assert set(target["p"]["next"]) == {"q", "r"}
 
 
 class TestCutOffAnswers:
@@ -1930,6 +2071,12 @@ class TestLogMessages:
 
 class TestPackageExports:
     """What the model package exports."""
+
+    def test_import_does_not_change_the_bytecode_setting(self, monkeypatch):
+        """Importing the package must not switch off .pyc files for the whole process."""
+        monkeypatch.setattr(sys, "dont_write_bytecode", False)
+        importlib.reload(model_package)
+        assert sys.dont_write_bytecode is False
 
     def test_every_exported_name_is_importable(self):
         assert set(model_package.__all__) == {

@@ -28,6 +28,13 @@ logger:
   log_runtime: True
   format: "%Y-%m-%d %H:%M:%S"
   encoding: "utf-8"
+  level: "info"
+  runtime_format: "minutes"
+  console: True
+  colors:
+    info: "white"
+    warning: "yellow"
+    error: "red"
 ```
 
 See the [`logger` documentation](https://github.com/Goldkugel/logger) for these fields.
