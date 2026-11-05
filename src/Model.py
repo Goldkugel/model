@@ -188,6 +188,9 @@ class Model:
         
         self.llm = LLM(
             model=model,
+            # None loads the cached or the latest version.
+            revision=self.config.revision.get(model),
+            tokenizer_revision=self.config.revision.get(model),
             tensor_parallel_size=gpus,
             enforce_eager=self.config.enforce_eager,
             max_model_len=self.config.max_model_len,
@@ -690,10 +693,11 @@ class Model:
             f"{generated} answers generated, {reused} stored and "
             f"{shared} shared with identical histories."
         )
-        l.log(
-            f"{prompt_tokens} prompt and {output_tokens} generated tokens in "
-            f"{_duration(elapsed)} ({_rate(output_tokens, elapsed)} generated tokens/s)."
-        )
+        if generated > 0:
+            l.log(
+                f"{prompt_tokens} prompt and {output_tokens} generated tokens in "
+                f"{_duration(elapsed)} ({_rate(output_tokens, elapsed)} generated tokens/s)."
+            )
         l.log(f"Generating answers for {len(unprocessed_indices)} histories completed.")
 
         self.generationStats.append({
@@ -960,7 +964,7 @@ class Model:
         up once, so that a model missing from the local cache is logged once.
         """
         if not self.revisionLooked and self.model is not None:
-            self.revision = modelRevision(self.model)
+            self.revision = modelRevision(self.model, self.config.revision.get(self.model))
             self.revisionLooked = True
         return self.revision
 
@@ -1034,18 +1038,21 @@ class Model:
             l.log(f"Could not locate a valid JSON object at index {index}.")
             return None
 
-    def getModelName(self) -> Optional[str]:
+    def getModelName(self, model_id: Optional[str] = None) -> Optional[str]:
         """
-        Returns the name of the loaded model: its ID in config.model_id
+        Returns the name of a model as the logs and file names use it: its ID
         without the organisation, e.g. "medgemma-4b-it" for
-        "google/medgemma-4b-it" (the last part of a local path). The full ID
-        is self.model.
+        "google/medgemma-4b-it" (the last part of a local path), like
+        Embedder.getModelName(). Without `model_id`, the name of the loaded
+        model (self.model).
 
-        :return: The model name, or None if no model is loaded.
+        :param model_id: A model ID; None for the loaded model.
+        :return: The model name, or None if no model is given or loaded.
         """
-        if self.model is None:
+        model_id = self.model if model_id is None else model_id
+        if model_id is None:
             return None
-        return self.model.rstrip("/").rsplit("/", 1)[-1]
+        return str(model_id).rstrip("/").rsplit("/", 1)[-1]
 
     @staticmethod
     def getModelCount(

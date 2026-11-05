@@ -9,6 +9,9 @@ logger:
 llm:
   model_id:
     - "google/medgemma-4b-it"
+  # The Hugging Face commit per model ID; a model without one loads the cached
+  # or latest version (the run metadata records it either way).
+  revision: {}
   device: "cuda"
   expert_parallel_models:
     - "Qwen3-30B"

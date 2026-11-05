@@ -134,18 +134,27 @@ def describeError(e: BaseException, width: int = 90) -> str:
     long).
     """
     name = type(e).__name__
-    message = textwrap.shorten(str(e).rstrip("."), width=max(width - len(name) - 2, 20),
-                               placeholder=" (...)")
+    message = " ".join(str(e).split())
+    if len(name) + 2 + len(message) > width:
+        message = textwrap.shorten(message.rstrip("."), width=max(width - len(name) - 8, 10),
+                                   placeholder="")
+        # A parenthesis the cut leaves open is dropped with the rest.
+        if message.count("(") > message.count(")"):
+            message = message[:message.rindex("(")].rstrip()
+        message = f"{message.rstrip(' .,;:')} (...)"
     return f"{name}: {message}" if message else name
 
 
-def modelRevision(model_id: str) -> Optional[str]:
+def modelRevision(model_id: str, configured: Optional[str] = None) -> Optional[str]:
     """
-    Returns the Hugging Face commit hash of the locally cached snapshot of
-    `model_id`, i.e. the exact model version vLLM loads. Returns None for a
-    local model directory, or if the snapshot cannot be found; the latter is
-    logged, since the run metadata then lacks the model version.
+    Returns the Hugging Face revision of `model_id` that vLLM loads: the
+    configured one (config.revision), otherwise the commit hash of the
+    locally cached snapshot. Returns None for a local model directory, or if
+    no cached version is found; the latter is logged, since the run metadata
+    then lacks the model version.
     """
+    if configured:
+        return configured
     if os.path.isdir(model_id):
         return None
     try:
@@ -156,9 +165,30 @@ def modelRevision(model_id: str) -> Optional[str]:
         # Cached snapshots live in .../snapshots/<commit hash>
         return os.path.basename(os.path.normpath(snapshot))
     except Exception as e:
+        # vLLM downloads only the files it needs, so huggingface_hub may find
+        # the snapshot incomplete; the cache still records its commit.
+        revision = cachedRevision(model_id)
+        if revision is not None:
+            return revision
         Logger().log(f"Could not determine the revision of model '{model_id}'.")
         Logger().log(f"Reason: {describeError(e)}.")
         return None
+
+
+def cachedRevision(model_id: str) -> Optional[str]:
+    """
+    Returns the commit the Hugging Face cache records for the main branch of
+    `model_id` (models--<org>--<name>/refs/main), or None if there is none.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+    except Exception:
+        return None
+    path = os.path.join(HF_HUB_CACHE, "models--" + model_id.replace("/", "--"), "refs", "main")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip() or None
 
 
 def fileSHA256(path: str) -> Optional[str]:

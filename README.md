@@ -111,6 +111,7 @@ llm:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `model_id` | `list[str]` | `[]` | HuggingFace or local model identifiers. `Model(index=N)` selects which entry to load. |
+| `revision` | `dict[str, str]` | `{}` | The Hugging Face commit (or tag) per model ID, so that a run always loads the same model version; a model without an entry loads the cached or latest version. |
 | `seed` | `int` | `2898231092` | Seed for vLLM and every sampling request, for reproducible generation. |
 | `temperature` | `float` | `0.01` | Sampling temperature (`0.0`–`2.0`; 0 = greedy). |
 | `top_p` | `float` | `0.95` | Nucleus sampling probability mass (`>0`–`1.0`). |
@@ -309,7 +310,7 @@ Failures that do not stop a run are written to the log instead: a cleanup step o
 | `run_id`, `started`, `updated` | Unique id of the `Model` instance, its start time and the time of the last update |
 | `host`, `slurm_job_id`, `python` | Host name, `SLURM_JOB_ID` (if any) and Python version |
 | `packages` | Installed versions of `model`, `logger`, `vllm`, `torch` and `transformers` |
-| `model` | `model_id`, its index in the config and the Hugging Face commit hash of the cached snapshot (`null` for a local directory) |
+| `model` | `model_id`, its index in the config and its revision: the configured one, otherwise the commit of the cached snapshot (also when huggingface_hub finds the snapshot incomplete, from the cache's `refs/main`); `null` for a local directory |
 | `gpus` | Number and names of the GPUs and the CUDA version |
 | `prompt_files` | SHA-256 of every configured prompt file (`null` if missing) |
 | `config` | The complete `llm` configuration |

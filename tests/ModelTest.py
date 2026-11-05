@@ -19,7 +19,7 @@ from model            import (
 import model as model_package
 from model.ModelUtils import (
     systemRole, userRole, modelRole, writePrompt, writeJSON, modelRevision, packageVersions,
-    updateRunRecord, messageTruncatedElement,
+    updateRunRecord, messageTruncatedElement, describeError,
 )
 import model.ModelUtils as model_utils
 import logger.FileUtils as logger_file_utils
@@ -765,6 +765,11 @@ class TestGetModelName:
 
         assert bare_model.getModelName() is None
 
+    def test_names_a_given_model_id(self, bare_model):
+        bare_model.model = None
+
+        assert bare_model.getModelName("mistralai/Mistral-7B-Instruct-v0.2") == "Mistral-7B-Instruct-v0.2"
+
 
 # --- Model.getModelCount --------------------------------------------------------------
 
@@ -1286,7 +1291,7 @@ class TestAnswerStore:
         bare_model.generate()
 
         # E.g. the model is not in the local Hugging Face cache
-        monkeypatch.setattr(model_module, "modelRevision", lambda model_id: None)
+        monkeypatch.setattr(model_module, "modelRevision", lambda model_id, configured=None: None)
         run = _new_run(bare_model, revision=None, revisionLooked=False)
         run.addPrompt(userRole, ["q"])
 
@@ -1797,6 +1802,35 @@ class TestModelUtils:
 
         assert modelRevision("org/name") is None
         assert any("revision of model 'org/name'" in message for message in logged)
+
+    def test_model_revision_is_the_configured_one(self):
+        assert modelRevision("org/name", "def456") == "def456"
+
+    def test_model_revision_of_an_incomplete_snapshot_is_the_cached_commit(
+        self, tmp_path, monkeypatch, logged
+    ):
+        def incomplete(model_id, local_files_only):
+            raise RuntimeError("The cached snapshot for 'org/name' (revision 'main') is incomplete.")
+        hub = types.ModuleType("huggingface_hub")
+        hub.snapshot_download = incomplete
+        constants = types.ModuleType("huggingface_hub.constants")
+        constants.HF_HUB_CACHE = str(tmp_path)
+        monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+        monkeypatch.setitem(sys.modules, "huggingface_hub.constants", constants)
+        refs = tmp_path / "models--org--name" / "refs"
+        refs.mkdir(parents=True)
+        (refs / "main").write_text("abc123\n")
+
+        assert modelRevision("org/name") == "abc123"
+        assert not any("revision of model" in message for message in logged)
+
+    def test_a_cut_error_leaves_no_parenthesis_open(self):
+        error = RuntimeError("The cached snapshot for 'google/medgemma-4b-it' (revision 'main') "
+                             "misses files that the model needs to be loaded by vLLM.")
+        described = describeError(error, width=70)
+        assert len(described) <= 70
+        assert described.endswith(" (...)")
+        assert described.count("(") == described.count(")")
 
 
 # --- Log messages ----------------------------------------------------------------------
