@@ -936,6 +936,109 @@ class TestFileNames:
         }
 
 
+# --- Model.setSeed ------------------------------------------------------------------
+
+class TestSetSeed:
+    """Switching the seed of a loaded model (setSeed())."""
+
+    @pytest.fixture
+    def sampling(self, monkeypatch) -> list[dict]:
+        """Records the keyword arguments of every SamplingParams()."""
+        calls = []
+        monkeypatch.setattr(model_module, "SamplingParams", lambda **kwargs: calls.append(kwargs) or kwargs)
+        return calls
+
+    def test_updates_the_config_and_the_sampling_params(self, bare_model, sampling):
+        config = bare_model.config
+
+        bare_model.setSeed(7)
+
+        assert bare_model.config.seed == 7
+        assert bare_model.sampling_params == {
+            "temperature": config.temperature,
+            "top_p": config.top_p,
+            "max_tokens": config.max_tokens,
+            "seed": 7,
+        }
+        # The config is copied, the other settings are kept
+        assert config.seed == 42
+        assert bare_model.config.model_dump() == {**config.model_dump(), "seed": 7}
+
+    def test_does_not_load_the_model_again(self, bare_model, sampling):
+        bare_model.llm = llm = FakeLLM()
+
+        bare_model.setSeed(7)
+
+        assert bare_model.llm is llm
+
+    @pytest.mark.parametrize("seed", ["7", 7.0, True, None])
+    def test_a_seed_that_is_no_int_raises(self, bare_model, sampling, seed):
+        with pytest.raises(TypeError, match="must be an int"):
+            bare_model.setSeed(seed)
+
+        assert bare_model.config.seed == 42 and sampling == []
+
+    def test_a_store_of_another_seed_is_refused(self, bare_model, sampling):
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        bare_model.reset()
+        bare_model.setSeed(7)
+        bare_model.addPrompt(userRole, ["q"])
+
+        with pytest.raises(ValueError, match=r"seed: 42 -> 7"):
+            bare_model.generate()
+        # Nothing was generated, and the store keeps the answers of seed 42
+        assert bare_model.llm.batches == [1]
+        assert _stored(bare_model)["settings"]["seed"] == 42
+
+    def test_the_loaded_store_is_not_reused_after_a_seed_change(self, bare_model, sampling):
+        # Also if setSeed() is bypassed, the store of the old seed is not
+        # used for the answers of the new one
+        bare_model.llm = FakeLLM()
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        bare_model.reset()
+        bare_model.config = bare_model.config.model_copy(update={"seed": 7})
+        bare_model.addPrompt(userRole, ["q"])
+
+        with pytest.raises(ValueError, match=r"seed: 42 -> 7"):
+            bare_model.generate()
+
+    def test_every_seed_gets_its_own_store_with_a_postfix(self, bare_model, sampling, tmp_path):
+        bare_model.llm = FakeLLM()
+        for seed in (1, 2, 1):
+            bare_model.reset()
+            bare_model.setSeed(seed)
+            bare_model.setPostfix(f"seed{seed}")
+            bare_model.addPrompt(userRole, ["q"])
+            bare_model.generate()
+
+        # Seed 1 is generated once; its second run takes the stored answer
+        assert bare_model.llm.batches == [1, 1]
+        assert [stats["seed"] for stats in bare_model.generationStats] == [1, 2, 1]
+        assert [stats["stored"] for stats in bare_model.generationStats] == [0, 0, 1]
+        stores = sorted(name for name in os.listdir(tmp_path / "tmp") if name.endswith(".tmp"))
+        assert stores == ["raw_model-a_seed1.tmp", "raw_model-a_seed2.tmp"]
+        assert _stored(bare_model)["settings"]["seed"] == 1
+
+    def test_generate_passes_the_new_sampling_params(self, bare_model, sampling, monkeypatch):
+        bare_model.llm = FakeLLM()
+        passed = []
+        chat = bare_model.llm.chat
+        monkeypatch.setattr(bare_model.llm, "chat", lambda histories, sampling_params, **kwargs:
+                            passed.append(sampling_params) or chat(histories, sampling_params, **kwargs))
+
+        bare_model.setSeed(7)
+        bare_model.setPostfix("seed7")
+        bare_model.addPrompt(userRole, ["q"])
+        bare_model.generate()
+
+        assert [params["seed"] for params in passed] == [7]
+
+
 # --- Model.getTurnCount / getPrompt / getAnswer --------------------------------------
 
 class TestTurns:

@@ -112,7 +112,7 @@ llm:
 |---|---|---|---|
 | `model_id` | `list[str]` | `[]` | HuggingFace or local model identifiers. `Model(index=N)` selects which entry to load. |
 | `revision` | `dict[str, str]` | `{}` | The Hugging Face commit (or tag) per model ID, so that a run always loads the same model version; a model without an entry loads the cached or latest version. Every key must also appear in `model_id`, so a typo cannot leave a model unpinned; spaces around keys and values are removed. |
-| `seed` | `int` | `2898231092` | Seed for vLLM and every sampling request, for reproducible generation. |
+| `seed` | `int` | `2898231092` | Seed for vLLM and every sampling request, for reproducible generation; `setSeed()` changes the seed of the sampling requests of a loaded model. |
 | `temperature` | `float` | `0.01` | Sampling temperature (`0.0`–`2.0`; 0 = greedy). |
 | `top_p` | `float` | `0.95` | Nucleus sampling probability mass (`>0`–`1.0`). |
 | `max_model_len` | `int` | `8192` | Maximum context length (prompt + generated tokens). |
@@ -199,6 +199,18 @@ model.addPrompt(role="user", message=["What is microcephaly?"])
 model.generate()
 ```
 
+To sample several answers per prompt, switch the seed of the loaded model with `setSeed(seed)` instead of loading the model again. It updates `model.config.seed` and the sampling parameters of the next `generate()` calls (temperature, `top_p` and `max_tokens` stay). The seed is one of the settings of the answer store, so give every seed its own store with `setPostfix()`; otherwise the next `generate()` raises a `ValueError`, since the store was written with another seed:
+
+```python
+first_seed = model.config.seed
+for seed in range(first_seed, first_seed + 3):
+    model.reset()
+    model.setSeed(seed)
+    model.setPostfix(f"seed{seed}")
+    model.addPromptsFromFile(0, concepts)
+    model.generate()
+```
+
 ### Configuration sources
 
 Besides a YAML path, `Model` accepts a dict or a `ModelConfig`:
@@ -275,7 +287,7 @@ model.generate()   # uses the answers of an earlier run, generates the rest
 
 `reasoning` and `truncated` are only present for answers that have them. A stored answer is used only if the history's earlier answers are the stored ones as well, since an answer depends on them. Histories with the same prompts share their nodes: a turn several histories share (e.g. a first prompt about the same concept) is generated once, and identical histories in one `generate()` call get the same answer. Changing a prompt (also the system prompt) leads to new nodes, so its answers are generated anew while the other answers are kept.
 
-**Settings.** The answers depend on `model_id` and the model's revision, `seed`, `temperature`, `top_p`, `max_tokens`, `max_model_len`, `dtype`, `quantization`, `enable_thinking`, `reasoning_start_tag` and `reasoning_end_tag`. A store written with other values of these is refused with a `ValueError` naming them (an unknown revision, e.g. of a model missing from the local cache, counts as no difference); the other settings (folders, `chunk_size`, GPU memory, batching) may change.
+**Settings.** The answers depend on `model_id` and the model's revision, `seed`, `temperature`, `top_p`, `max_tokens`, `max_model_len`, `dtype`, `quantization`, `enable_thinking`, `reasoning_start_tag` and `reasoning_end_tag`. A store written with other values of these is refused with a `ValueError` naming them (an unknown revision, e.g. of a model missing from the local cache, counts as no difference), also after `setSeed()` changed the seed of a loaded model; the other settings (folders, `chunk_size`, GPU memory, batching) may change.
 
 **Restoring histories.** A history is put back together exactly as it was generated: its prompts come from the caller, and every answer, with its reasoning and cut-off mark, from the node of its prompt, but only while the history's earlier answers are the stored ones. The turns stored after a prompt always followed the answer stored on it (or no answer, for two prompts in a row), so answers of different histories are never combined.
 
@@ -295,6 +307,7 @@ All methods raise an exception on failure; none returns an error code:
 | `generate()` | `ValueError` if the answer store is not one or was written with other settings, `RuntimeError` if there is something to generate but the model was closed with `close()` |
 | `getPrompt()`, `getAnswer()`, `getTurnCount()` | `IndexError` for an invalid history index or turn |
 | `setPostfix()` | `ValueError` if the postfix contains a path separator |
+| `setSeed()` | `TypeError` if the seed is not an `int` |
 | `toJSON()` | `IndexError` for an invalid history index; returns `None` if the history has no answer or the answer contains no JSON |
 
 `generate()` returns the number of answers it generated (not counting stored answers and copies for identical histories).
@@ -315,7 +328,7 @@ The errors above are also written to the log, with the level `error`. Failures t
 | `prompt_files` | SHA-256 of every configured prompt file (`null` if missing) |
 | `config` | The complete `llm` configuration |
 | `files` | Paths of the answer store and the prompt log |
-| `generations` | One entry per `generate()` call: start and end time, duration, number of histories, answers generated, taken from the store (`stored`) and copied to identical histories (`shared`), skipped and truncated history indices, prompt and generated tokens, and the approximate number of reasoning tokens |
+| `generations` | One entry per `generate()` call: start and end time, the seed (see `setSeed()`), duration, number of histories, answers generated, taken from the store (`stored`) and copied to identical histories (`shared`), skipped and truncated history indices, prompt and generated tokens, and the approximate number of reasoning tokens |
 
 ### Changes in 3.0
 

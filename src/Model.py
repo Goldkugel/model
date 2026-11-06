@@ -176,13 +176,7 @@ class Model:
 
         l.log(f"Scanning device '{device}' completed.")
         
-        # The per-request seed makes each answer independent of the batching.
-        self.sampling_params = SamplingParams(
-            temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            max_tokens=self.config.max_tokens,
-            seed=self.config.seed
-        )
+        self.sampling_params = self._samplingParams()
 
         l.log(f"Loading model into {device}...")
 
@@ -227,6 +221,46 @@ class Model:
             raise
 
         l.log(f"Loading model at index {index}: '{model}' completed.")
+
+    def _samplingParams(self) -> SamplingParams:
+        """
+        The sampling parameters of every request, from config.temperature,
+        top_p, max_tokens and seed. The per-request seed makes each answer
+        independent of the batching.
+        """
+        return SamplingParams(
+            temperature=self.config.temperature,
+            top_p=self.config.top_p,
+            max_tokens=self.config.max_tokens,
+            seed=self.config.seed
+        )
+
+    def setSeed(self, seed: int) -> None:
+        """
+        Switches the loaded model to another sampling seed without loading
+        it again: config.seed and the sampling parameters of the next
+        generate() calls use `seed`; temperature, top_p and max_tokens stay.
+        The seed vLLM was started with is not changed; the answers depend
+        only on the per-request seed.
+
+        The seed is one of the settings of the answer store (see
+        _answerSettings()), so answers of another seed are never reused: the
+        next generate() loads the store again and raises a ValueError if it
+        was written with another seed. To keep the answers of every seed,
+        give each seed its own store with setPostfix(), e.g.
+        setPostfix(f"seed{seed}").
+
+        :param seed: The new seed.
+        :raises TypeError: If `seed` is not an int.
+        """
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError(f"The seed must be an int, not {type(seed).__name__}.")
+
+        self.config = self.config.model_copy(update={"seed": seed})
+        self.sampling_params = self._samplingParams()
+        # Loaded again with the new settings by the next generate()
+        self.store = None
+        Logger().log(f"Seed: {seed}.")
 
     @staticmethod
     def _resolveConfig(
@@ -714,6 +748,8 @@ class Model:
 
         self.generationStats.append({
             "started": started,
+            # setSeed() may change it between the calls
+            "seed": self.config.seed,
             "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
             "seconds": round(elapsed, 1),
             "histories": len(unprocessed_indices),
@@ -986,10 +1022,16 @@ class Model:
         answers in a JSON file (see AnswerStore and _checkpointPath()),
         loaded on first use.
 
+        The store is loaded again when its file (setPostfix()) or the
+        settings (e.g. setSeed()) changed since it was loaded, so answers are
+        never stored or reused under settings they were not generated with.
+
         :raises ValueError: If the file was written with other settings (see
             _answerSettings()).
         """
-        if self.store is None or self.store.path != self._checkpointPath():
+        if (self.store is None
+                or self.store.path != self._checkpointPath()
+                or self.store.settings != self._answerSettings()):
             store = AnswerStore(self._checkpointPath(), self._answerSettings())
             store.load()
             self.store = store
