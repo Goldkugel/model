@@ -73,6 +73,7 @@ def bare_model(model_config_data, tmp_path) -> Model:
     model.sampling_params = None
     model.model = model_config_data["model_id"][0]
     model.skippedHistories = []
+    model.skippedLengths = {}
     model.truncatedHistories = []
     model.runId = "test-run"
     model.runStarted = "2026-01-01T00:00:00+00:00"
@@ -137,6 +138,19 @@ class FakeTokenizer:
 
     def encode(self, text, add_special_tokens=True):
         return [0] * len(text)
+
+
+class AlternatingTokenizer(FakeTokenizer):
+    """
+    A FakeTokenizer whose template, like Gemma's, refuses two messages of the
+    same role in a row.
+    """
+
+    def apply_chat_template(self, history, tokenize, add_generation_prompt, **kwargs):
+        roles = [message[messageRoleElement] for message in history]
+        if any(a == b for a, b in zip(roles, roles[1:])):
+            raise ValueError("Conversation roles must alternate")
+        return super().apply_chat_template(history, tokenize, add_generation_prompt, **kwargs)
 
 
 class FakeLLM:
@@ -1171,6 +1185,73 @@ class TestGenerate:
         assert bare_model.llm.batches == [1]
         assert bare_model.toJSON(1) is None
         assert bare_model.messageHistories[2] == [{messageRoleElement: userRole, messageTextElement: "y" * 50}]
+
+    def test_a_skipped_history_stays_skipped_in_the_next_turn(self, bare_model, logged):
+        bare_model.llm = FakeLLM()
+        bare_model.llm.tokenizer = AlternatingTokenizer()
+        bare_model.config.max_model_len = 40
+        bare_model.addPrompt(userRole, ["short", "x" * 40])
+        assert bare_model.generate() == 1
+        assert bare_model.skippedHistories == [1]
+
+        # The next turn: history 1 now has two prompts in a row, which the
+        # template refuses; it is skipped without asking the template
+        bare_model.addPrompt(userRole, ["next"])
+        assert bare_model.generate() == 1
+
+        assert bare_model.skippedHistories == [1]
+        assert "Skipping history 1: an earlier prompt of it was skipped and has no answer." in logged
+        assert not any("refuses" in message for message in logged)
+        assert bare_model.messageHistories[0][-1][messageTextElement] == "answer to next"
+        assert [m[messageRoleElement] for m in bare_model.messageHistories[1]] == [userRole, userRole]
+
+    def test_a_skipped_history_is_tried_again_without_a_new_prompt(self, bare_model, logged):
+        bare_model.llm = FakeLLM()
+        bare_model.config.max_model_len = 10
+        bare_model.addPrompt(userRole, ["x" * 10])
+        bare_model.generate()
+
+        assert bare_model.generate() == 0
+        assert bare_model.skippedHistories == [0]
+        assert not any("earlier prompt" in message for message in logged)
+
+    def test_a_skipped_history_answered_by_hand_is_generated(self, bare_model, logged):
+        bare_model.llm = FakeLLM()
+        bare_model.config.max_model_len = 40
+        bare_model.addPrompt(userRole, ["short", "x" * 40])
+        bare_model.generate()
+        # The prompt of history 1 gets an answer from elsewhere, and the
+        # first prompt is shortened, so the next turn fits
+        bare_model.messageHistories[1][0][messageTextElement] = "y"
+        bare_model.messageHistories[1].append({messageRoleElement: modelRole, messageTextElement: "a"})
+
+        bare_model.addPrompt(userRole, ["next"])
+        assert bare_model.generate() == 2
+        assert bare_model.skippedHistories == []
+        assert bare_model.skippedLengths == {}
+
+    def test_a_history_the_template_refuses_is_skipped(self, bare_model, logged_levels):
+        bare_model.llm = FakeLLM()
+        bare_model.llm.tokenizer = AlternatingTokenizer()
+        bare_model.addPrompt(userRole, ["a", "b", "c"])
+        # Two prompts in a row in history 1 only
+        bare_model.messageHistories[1].append({messageRoleElement: userRole, messageTextElement: "again"})
+
+        assert bare_model.generate() == 2
+
+        assert bare_model.skippedHistories == [1]
+        assert bare_model.llm.batches == [2]
+        assert ("Skipping history 1: the chat template refuses it (ValueError: Conversation "
+            "roles must alternate)." , "warning") in logged_levels
+
+    def test_reset_forgets_skipped_histories(self, bare_model):
+        bare_model.llm = FakeLLM()
+        bare_model.config.max_model_len = 10
+        bare_model.addPrompt(userRole, ["x" * 10])
+        bare_model.generate()
+
+        bare_model.reset()
+        assert bare_model.skippedLengths == {}
 
     def test_chunk_without_fitting_prompts_is_not_sent(self, bare_model):
         bare_model.llm = FakeLLM()

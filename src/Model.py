@@ -111,8 +111,12 @@ class Model:
         self.sampling_params: Optional[SamplingParams] = None
         self.model: Optional[str] = None
         self.config: Optional[ModelConfig] = None
-        # Histories the last generate() skipped (prompt exceeds max_model_len)
+        # Histories the last generate() skipped (prompt exceeds max_model_len,
+        # refused by the chat template, or an earlier prompt without answer)
         self.skippedHistories: list[int] = []
+        # Length of every history when generate() skipped it; a history that
+        # has grown since has a prompt without answer and is skipped again
+        self.skippedLengths: dict[int, int] = {}
         # Histories whose last answer was cut off at max_tokens
         self.truncatedHistories: list[int] = []
         # Run metadata (see _writeRunMetadata())
@@ -550,9 +554,12 @@ class Model:
         not stored, and replaced by the next generate() call (raise
         max_tokens first, or it is cut off again).
 
-        A history whose prompt does not fit into config.max_model_len is
-        skipped and listed in self.skippedHistories, instead of failing its
-        whole chunk.
+        A history whose prompt does not fit into config.max_model_len, or
+        that the chat template refuses, is skipped and listed in
+        self.skippedHistories, instead of failing its whole chunk. A skipped
+        history that got further prompts afterwards (the next turn) is
+        skipped again without the chat template: its earlier prompt has no
+        answer, which many templates refuse ("roles must alternate").
 
         :return: Number of answers generated (not counting stored answers and
             the copies for identical histories).
@@ -581,6 +588,19 @@ class Model:
         # Fails before anything is generated if the settings differ
         store = self._answerStore()
 
+        # Skipped before and grown since without an answer to the skipped
+        # prompt (e.g. the next turn was added): it is unanswered for good
+        unanswered = [
+            idx for idx in unprocessed_indices
+            if Model._followsSkippedPrompt(self.messageHistories[idx], self.skippedLengths.get(idx))
+        ]
+        for idx in unanswered:
+            l.log(f"Skipping history {idx}: an earlier prompt of it was skipped and has no answer.")
+        self.skippedHistories.extend(unanswered)
+        unanswered_set = set(unanswered)
+        processed_indices = unprocessed_indices
+        unprocessed_indices = [idx for idx in unprocessed_indices if idx not in unanswered_set]
+
         # Remove empty answers, so their prompt is answered again
         for idx in unprocessed_indices:
             if Model._endsWithEmptyAnswer(self.messageHistories[idx]):
@@ -588,7 +608,7 @@ class Model:
 
         started = datetime.now().astimezone().isoformat(timespec="seconds")
         run_start = time.perf_counter()
-        l.log(f"Generating answers for {len(unprocessed_indices)} histories...")
+        l.log(f"Generating answers for {len(processed_indices)} histories...")
 
         missing_indices = []
         reused = 0
@@ -629,10 +649,9 @@ class Model:
 
         if generate_indices:
             tokenizer = self.llm.get_tokenizer()
-            # The same for every history, as they share template and settings
-            prompt_opens_reasoning = self._promptOpensReasoning(
-                tokenizer, self.messageHistories[generate_indices[0]]
-            )
+            # The same for every history, as they share template and settings;
+            # taken from the first history the chat template accepts
+            prompt_opens_reasoning = None
             chunk_size = self.config.chunk_size
             total = len(generate_indices)
             # Rounded up
@@ -654,6 +673,10 @@ class Model:
                 for idx in chunk_indices:
                     if idx not in batch_indices:
                         self.skippedHistories.extend(copies[idx])
+                if prompt_opens_reasoning is None and batch_indices:
+                    prompt_opens_reasoning = self._promptOpensReasoning(
+                        tokenizer, self.messageHistories[batch_indices[0]]
+                    )
                 chunk_output_tokens = 0
 
                 if batch_indices:
@@ -728,8 +751,9 @@ class Model:
         # At most 10 indexes per row; all are in skippedHistories and
         # truncatedHistories.
         if self.skippedHistories:
-            l.log(f"Skipped {len(self.skippedHistories)} histories whose prompt exceeds "
-                  f"max_model_len: {_firstIndexes(self.skippedHistories)}.")
+            # Why each one was skipped is logged above
+            l.log(f"Skipped {len(self.skippedHistories)} histories: "
+                  f"{_firstIndexes(self.skippedHistories)}.")
         if self.truncatedHistories:
             l.log(f"{len(self.truncatedHistories)} answers were cut off at max_tokens "
                   f"({self.config.max_tokens}): {_firstIndexes(self.truncatedHistories)}.")
@@ -744,7 +768,8 @@ class Model:
                 f"{prompt_tokens} prompt and {output_tokens} generated tokens in "
                 f"{_duration(elapsed)} ({_rate(output_tokens, elapsed)} generated tokens/s)."
             )
-        l.log(f"Generating answers for {len(unprocessed_indices)} histories completed.")
+        l.log(f"Generating answers for {len(processed_indices)} histories completed.")
+        self._rememberSkipped(processed_indices)
 
         self.generationStats.append({
             "started": started,
@@ -752,7 +777,7 @@ class Model:
             "seed": self.config.seed,
             "finished": datetime.now().astimezone().isoformat(timespec="seconds"),
             "seconds": round(elapsed, 1),
-            "histories": len(unprocessed_indices),
+            "histories": len(processed_indices),
             "answers": generated,
             "stored": reused,
             "shared": shared,
@@ -767,20 +792,56 @@ class Model:
 
         return generated
 
+    @staticmethod
+    def _followsSkippedPrompt(history: list[dict], skipped_length: Optional[int]) -> bool:
+        """
+        Returns whether `history`, skipped by generate() when it had
+        `skipped_length` messages (None: never skipped), has grown since
+        without an answer to the skipped prompt.
+        """
+        return (
+            skipped_length is not None
+            and len(history) > skipped_length
+            and history[skipped_length].get(messageRoleElement) != modelRole
+        )
+
+    def _rememberSkipped(self, processed: list[int]) -> None:
+        """
+        Records the length of every history in self.skippedHistories (see
+        self.skippedLengths), and forgets the other histories of `processed`
+        (those generate() answered).
+        """
+        skipped = set(self.skippedHistories)
+        for idx in processed:
+            if idx in skipped:
+                self.skippedLengths[idx] = len(self.messageHistories[idx])
+            else:
+                self.skippedLengths.pop(idx, None)
+
     def _fitsContext(self, tokenizer, index: int) -> bool:
         """
         Returns whether the prompt of the history at `index`, formatted with
         the chat template, leaves room for at least one generated token
-        within config.max_model_len. Otherwise the index is added to
-        self.skippedHistories.
+        within config.max_model_len. Otherwise, or if the chat template
+        refuses the history (e.g. "Conversation roles must alternate"), the
+        index is added to self.skippedHistories.
         """
         # Exactly as generate() sends it
-        token_ids = tokenizer.apply_chat_template(
-            self._chatMessages(self.messageHistories[index]),
-            tokenize=True,
-            add_generation_prompt=True,
-            **self._chatTemplateArguments().get("chat_template_kwargs", {})
-        )
+        try:
+            token_ids = tokenizer.apply_chat_template(
+                self._chatMessages(self.messageHistories[index]),
+                tokenize=True,
+                add_generation_prompt=True,
+                **self._chatTemplateArguments().get("chat_template_kwargs", {})
+            )
+        # jinja2's TemplateError, or e.g. a ValueError of the tokenizer
+        except Exception as e:
+            Logger().log(
+                f"Skipping history {index}: the chat template refuses it "
+                f"({describeError(e)}).", level="warning"
+            )
+            self.skippedHistories.append(index)
+            return False
         # Some transformers versions return a BatchEncoding instead of a list
         if hasattr(token_ids, "keys"):
             token_ids = token_ids["input_ids"]
@@ -1237,6 +1298,7 @@ class Model:
         """
         self.messageHistories = []
         self.skippedHistories = []
+        self.skippedLengths = {}
         self.truncatedHistories = []
 
     def logPrompts(self) -> None:

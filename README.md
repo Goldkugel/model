@@ -9,7 +9,7 @@ A thin wrapper around [vLLM](https://github.com/vllm-project/vllm) for prompting
 - **Prompt templates** — load prompt files from `prompts/` and fill their `{placeholder}` fields per history.
 - **Native chat templates** — histories are sent to vLLM's chat interface (`LLM.chat()`), which formats them with the model's own chat template, so any chat model supported by vLLM works.
 - **Chunked generation with an answer store** — histories are generated in chunks of `chunk_size`; after every chunk the prompts and answers are stored in a JSON file (keyed by the hash of each prompt, with the settings they were generated with), so an interrupted run (e.g. a killed Slurm job) resumes where it stopped and answers are never generated twice.
-- **Context-length check** — a history whose prompt does not fit into `max_model_len` is skipped (and listed in `skippedHistories`) instead of failing its whole chunk.
+- **Context-length check** — a history whose prompt does not fit into `max_model_len`, or that the chat template refuses, is skipped (and listed in `skippedHistories`) instead of failing its whole chunk. A skipped history stays skipped in the following turns, since its unanswered prompt would make the template fail ("Conversation roles must alternate").
 - **Progress logging** — after every chunk the log shows answers and tokens generated, tokens per second, the elapsed time and the estimated remaining time.
 - **Run metadata** — package versions, the model's Hugging Face revision, GPUs, the full configuration, prompt file hashes and generation statistics are written to a JSON file for reproducibility.
 - **Multi-GPU** — all visible GPUs are used via tensor parallelism; Mixture-of-Experts models listed in `expert_parallel_models` additionally get expert parallelism.
@@ -169,7 +169,8 @@ with Model("./config/config.yaml", index=0) as model:
     model.generate()
 
     # None for an answer without valid JSON, and for histories in
-    # model.skippedHistories (prompt longer than max_model_len).
+    # model.skippedHistories (prompt longer than max_model_len, refused by
+    # the chat template, or an earlier prompt skipped).
     for i in range(len(concepts)):
         print(model.toJSON(i))
 

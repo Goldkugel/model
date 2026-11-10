@@ -35,7 +35,7 @@ A history is a list of messages in the chat-template format, e.g.:
 
 An answer of a thinking model also has a `"reasoning"` key (`messageReasoningElement`) holding its reasoning, and an answer cut off at `max_tokens` has `"truncated": True` (`messageTruncatedElement`); only `role` and `content` are sent to the model. An `assistant` message always follows a `user` message.
 
-`Model.messageHistories` holds one such list per independent conversation. `generate()` answers every history whose last message is not from the `assistant`, except those whose prompt does not fit into `max_model_len` (listed in `Model.skippedHistories`).
+`Model.messageHistories` holds one such list per independent conversation. `generate()` answers every history whose last message is not from the `assistant`, except those whose prompt does not fit into `max_model_len` or that the chat template refuses, and those skipped before that got a further prompt without an answer to the skipped one (all listed in `Model.skippedHistories`).
 
 ## Tests
 
